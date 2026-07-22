@@ -1,0 +1,21 @@
+[project]
+name = "comfy-instruction-api"
+version = "0.1.0"
+description = "复用现有 ComfyUI 队列的指令生图 API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116,<1",
+    "httpx>=0.28,<1",
+    "uvicorn>=0.35,<1",
+]
+
+[dependency-groups]
+dev = [
+    "pyfakefs>=5.9,<6",
+    "pytest>=8.4,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

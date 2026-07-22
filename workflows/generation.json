@@ -1,0 +1,388 @@
+{
+  "82": {
+    "inputs": {
+      "samples": [
+        "913:723",
+        1
+      ],
+      "vae": [
+        "294",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "169": {
+    "inputs": {
+      "filename_prefix": "api/%date:yyyyMMdd%",
+      "file_format": "webp",
+      "lossless_webp": false,
+      "quality": 95,
+      "embed_workflow": true,
+      "save_with_metadata": true,
+      "add_counter_to_filename": true,
+      "save_as_recipe": false,
+      "images": [
+        "82",
+        0
+      ]
+    },
+    "class_type": "Save Image (LoraManager)",
+    "_meta": {
+      "title": "API Output"
+    }
+  },
+  "294": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "297": {
+    "inputs": {
+      "model": [
+        "693",
+        0
+      ],
+      "clip": [
+        "300",
+        0
+      ]
+    },
+    "class_type": "CLIPNegPip",
+    "_meta": {
+      "title": "CLIP NegPip"
+    }
+  },
+  "300": {
+    "inputs": {
+      "clip_name": "qwen_3_06b_base.safetensors",
+      "type": "stable_diffusion",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "385": {
+    "inputs": {
+      "text": "\nspreading own pussy\n\n\ncowboy shot, from below, from side\n\n\nhina \\(dress\\) \\(blue archive\\), (mature:-1), aged down\ndemon girl, demon wings, demon horns, halo\n\n\nofficial alternate hairstyle\nwhite hair, hair up\npurple eyes, half-closed eyes\nseductive smile, parted lips, head tilt\n\n\nsee-through clothes\nlong purple puffy lace dress\nbare shoulders, elbow gloves, necklace\n\n\nribs, sideboob, small breasts, soft breasts, one breasts out\npussy, vaginal, thigh gap\npussy juice trail, pussy juice stain\n\n\n(simple background:-1.25)\nballroom, champagne flute, large windows, waiter in backgroud\n\n\n(lineart, flat color, anime coloring:2)\nrim light, light particles, cinematic lighting\ndepth of field, strong perspective, blurry background",
+      "clip": [
+        "717",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "API Instruction"
+    }
+  },
+  "387": {
+    "inputs": {
+      "text": "worst quality, low quality, score_1, score_2, score_3, artist name, jpeg artifacts, chromatic aberration",
+      "clip": [
+        "717",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "负面提示词"
+    }
+  },
+  "513": {
+    "inputs": {
+      "width": 960,
+      "height": 1280,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空Latent图像"
+    }
+  },
+  "693": {
+    "inputs": {
+      "unet_name": "anima\\anima_aesthetic_v1.1_rdbt_v12_simple_int8mixed_rowwise.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "708": {
+    "inputs": {
+      "unet_name": "anima\\rdbtAnima_b1V12_simple_int8mixed_rowwise.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "709": {
+    "inputs": {
+      "model": [
+        "708",
+        0
+      ],
+      "clip": [
+        "713",
+        1
+      ]
+    },
+    "class_type": "CLIPNegPip",
+    "_meta": {
+      "title": "CLIP NegPip"
+    }
+  },
+  "713": {
+    "inputs": {
+      "text": [
+        "873",
+        0
+      ],
+      "model": [
+        "297",
+        0
+      ],
+      "clip": [
+        "297",
+        1
+      ]
+    },
+    "class_type": "LoraTagLoader",
+    "_meta": {
+      "title": "Load LoRA Tag"
+    }
+  },
+  "717": {
+    "inputs": {
+      "text": [
+        "873",
+        0
+      ],
+      "model": [
+        "709",
+        0
+      ],
+      "clip": [
+        "709",
+        1
+      ]
+    },
+    "class_type": "LoraTagLoader",
+    "_meta": {
+      "title": "Load LoRA Tag"
+    }
+  },
+  "873": {
+    "inputs": {
+      "text1": "<lora:Style\\sky07v1:0.25>\n<lora:Style\\anima_rendering_detailer_base10:-0.25>"
+    },
+    "class_type": "TextBox1",
+    "_meta": {
+      "title": "Lora TAG"
+    }
+  },
+  "913:725": {
+    "inputs": {
+      "noise_seed": 907165749726664
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "随机噪波"
+    }
+  },
+  "913:729": {
+    "inputs": {
+      "step": [
+        "913:733",
+        0
+      ],
+      "sigmas": [
+        "913:732",
+        0
+      ]
+    },
+    "class_type": "SplitSigmas",
+    "_meta": {
+      "title": "分离Sigma"
+    }
+  },
+  "913:726": {
+    "inputs": {},
+    "class_type": "DisableNoise",
+    "_meta": {
+      "title": "禁用噪波"
+    }
+  },
+  "913:723": {
+    "inputs": {
+      "noise": [
+        "913:726",
+        0
+      ],
+      "guider": [
+        "913:730",
+        0
+      ],
+      "sampler": [
+        "913:728",
+        0
+      ],
+      "sigmas": [
+        "913:729",
+        1
+      ],
+      "latent_image": [
+        "913:724",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "二次采样"
+    }
+  },
+  "913:732": {
+    "inputs": {
+      "scheduler": "beta57",
+      "steps": [
+        "913:735",
+        1
+      ],
+      "denoise": 1,
+      "model": [
+        "713",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "基本调度器"
+    }
+  },
+  "913:730": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "717",
+        0
+      ],
+      "positive": [
+        "385",
+        0
+      ],
+      "negative": [
+        "387",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG引导器"
+    }
+  },
+  "913:728": {
+    "inputs": {
+      "sampler_name": "er_sde"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "K采样器选择"
+    }
+  },
+  "913:735": {
+    "inputs": {
+      "expression": "a + b",
+      "values.a": [
+        "913:733",
+        0
+      ],
+      "values.b": [
+        "913:734",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "数学表达式"
+    }
+  },
+  "913:727": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "713",
+        0
+      ],
+      "positive": [
+        "385",
+        0
+      ],
+      "negative": [
+        "387",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG引导器"
+    }
+  },
+  "913:724": {
+    "inputs": {
+      "noise": [
+        "913:725",
+        0
+      ],
+      "guider": [
+        "913:727",
+        0
+      ],
+      "sampler": [
+        "913:728",
+        0
+      ],
+      "sigmas": [
+        "913:729",
+        0
+      ],
+      "latent_image": [
+        "513",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "一次采样"
+    }
+  },
+  "913:733": {
+    "inputs": {
+      "value": 12
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "整数"
+    }
+  },
+  "913:734": {
+    "inputs": {
+      "value": 4
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "整数"
+    }
+  }
+}
