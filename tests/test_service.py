@@ -146,6 +146,7 @@ def test_llm_preprocessing_uses_openai_chat_completions_format() -> None:
 
 (simple background:-1.25)
 (lineart, flat color, anime coloring:1.5)
+dutch angle, dynamic angle
 rim light, light particles, cinematic lighting
 depth of field, strong perspective, blurry background"""
     )

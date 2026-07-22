@@ -16,6 +16,7 @@ WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "generation.json"
 PROMPT_SUFFIX = """
 (simple background:-1.25)
 (lineart, flat color, anime coloring:1.5)
+dutch angle, dynamic angle
 rim light, light particles, cinematic lighting
 depth of field, strong perspective, blurry background"""
 LOGGER = logging.getLogger(__name__)
@@ -413,10 +414,15 @@ async def submit_prompt(
     job_id: str,
     instruction: str,
 ) -> None:
+    prompt = build_prompt(template, instruction)
     try:
         response = await client.post(
             "/prompt",
-            json={"prompt_id": job_id, "prompt": build_prompt(template, instruction)},
+            json={
+                "prompt_id": job_id,
+                "prompt": prompt,
+                "extra_data": {"extra_pnginfo": {"workflow": prompt}},
+            },
         )
     except httpx.RequestError as error:
         raise UpstreamError(f"POST /prompt 请求失败: {type(error).__name__}") from error

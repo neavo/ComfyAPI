@@ -145,6 +145,7 @@ def test_new_accepts_instruction_and_returns_only_uuid() -> None:
 
 (simple background:-1.25)
 (lineart, flat color, anime coloring:1.5)
+dutch angle, dynamic angle
 rim light, light particles, cinematic lighting
 depth of field, strong perspective, blurry background"""
     )
@@ -157,6 +158,9 @@ depth of field, strong perspective, blurry background"""
         "save_with_metadata": True,
         "add_counter_to_filename": True,
         "save_as_recipe": False,
+    }
+    assert captured["extra_data"] == {
+        "extra_pnginfo": {"workflow": captured["prompt"]}
     }
     assert "生成雨夜街道" not in response.text
 
