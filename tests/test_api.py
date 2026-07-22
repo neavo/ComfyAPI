@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from app.main import app
-from app.service import GenerationService, Settings, validate_workflow
+from app.service import GenerationService, Settings, resolve_workflow
 
 
 def workflow_data() -> dict[str, object]:
@@ -18,17 +18,7 @@ def workflow_data() -> dict[str, object]:
             "_meta": {"title": "API Instruction"},
         },
         "20": {
-            "inputs": {
-                "filename_prefix": "api/%date:yyyyMMdd%",
-                "file_format": "webp",
-                "lossless_webp": False,
-                "quality": 95,
-                "embed_workflow": True,
-                "save_with_metadata": True,
-                "add_counter_to_filename": True,
-                "save_as_recipe": False,
-            },
-            "class_type": "Save Image (LoraManager)",
+            "inputs": {},
             "_meta": {"title": "API Output"},
         },
     }
@@ -75,7 +65,7 @@ def request(
             upstream,
             settings,
             "系统指令",
-            validate_workflow(workflow_data()),
+            resolve_workflow(workflow_data()),
         )
         headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
         async with httpx.AsyncClient(
@@ -143,25 +133,15 @@ def test_new_accepts_instruction_and_returns_only_uuid() -> None:
         captured["prompt"]["10"]["inputs"]["text"]
         == """a rainy neon street
 
+safe
+(mature:-1), (aged down:1)
 (simple background:-1.25)
-(lineart, flat color, anime coloring:1.5)
-dutch angle, dynamic angle
+(shiny skin:-1)
+(flat color, anime coloring:2)
 rim light, light particles, cinematic lighting
 depth of field, strong perspective, blurry background"""
     )
-    assert captured["prompt"]["20"]["inputs"] == {
-        "filename_prefix": "api/%date:yyyyMMdd%",
-        "file_format": "webp",
-        "lossless_webp": False,
-        "quality": 95,
-        "embed_workflow": True,
-        "save_with_metadata": True,
-        "add_counter_to_filename": True,
-        "save_as_recipe": False,
-    }
-    assert captured["extra_data"] == {
-        "extra_pnginfo": {"workflow": captured["prompt"]}
-    }
+    assert captured["extra_data"] == {"extra_pnginfo": {"workflow": captured["prompt"]}}
     assert "生成雨夜街道" not in response.text
 
 

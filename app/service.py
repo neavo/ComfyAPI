@@ -14,9 +14,11 @@ import httpx
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "generation.json"
 PROMPT_SUFFIX = """
+safe
+(mature:-1), (aged down:1)
 (simple background:-1.25)
-(lineart, flat color, anime coloring:1.5)
-dutch angle, dynamic angle
+(shiny skin:-1)
+(flat color, anime coloring:2)
 rim light, light particles, cinematic lighting
 depth of field, strong perspective, blurry background"""
 LOGGER = logging.getLogger(__name__)
@@ -55,7 +57,6 @@ class WorkflowTemplate:
     data: dict[str, Any]
     instruction_node_id: str
     output_node_id: str
-    filename_prefix: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,68 +201,35 @@ def load_workflow(path: Path = WORKFLOW_PATH) -> WorkflowTemplate:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"无法加载工作流 {path}: {error}") from error
-    return validate_workflow(data)
+    return resolve_workflow(data)
 
 
-def validate_workflow(data: object) -> WorkflowTemplate:
-    if not isinstance(data, dict) or not data:
-        raise RuntimeError("工作流根对象必须是非空的节点对象")
-    if not all(
-        isinstance(node_id, str) and isinstance(node, dict)
-        for node_id, node in data.items()
-    ):
-        raise RuntimeError("工作流必须以节点 ID 为键，且每个节点必须是对象")
+def resolve_workflow(data: object) -> WorkflowTemplate:
+    if not isinstance(data, dict):
+        raise RuntimeError("工作流必须是节点对象")
 
-    def titled(title: str) -> list[tuple[str, dict[str, Any]]]:
-        return [
+    def unique_node(title: str) -> tuple[str, dict[str, Any]]:
+        matches = [
             (node_id, node)
             for node_id, node in data.items()
-            if isinstance(node.get("_meta"), dict)
+            if isinstance(node_id, str)
+            and isinstance(node, dict)
+            and isinstance(node.get("_meta"), dict)
             and node["_meta"].get("title") == title
         ]
+        if len(matches) != 1:
+            raise RuntimeError(f"工作流必须恰好包含一个 {title} 节点")
+        return matches[0]
 
-    instruction_nodes = titled("API Instruction")
-    if len(instruction_nodes) != 1:
-        raise RuntimeError("工作流必须恰好包含一个 API Instruction 节点")
-    instruction_id, instruction = instruction_nodes[0]
+    instruction_id, instruction = unique_node("API Instruction")
     if (
         not isinstance(instruction.get("inputs"), dict)
         or "text" not in instruction["inputs"]
     ):
         raise RuntimeError("API Instruction 节点必须包含 inputs.text")
 
-    output_nodes = titled("API Output")
-    if len(output_nodes) != 1:
-        raise RuntimeError("工作流必须恰好包含一个 API Output 节点")
-    output_id, output = output_nodes[0]
-    if output.get("class_type") != "Save Image (LoraManager)":
-        raise RuntimeError("API Output 节点必须是 Save Image (LoraManager)")
-    inputs = output.get("inputs")
-    prefix = inputs.get("filename_prefix") if isinstance(inputs, dict) else None
-    if prefix != "api/%date:yyyyMMdd%":
-        raise RuntimeError(
-            "API Output.inputs.filename_prefix 必须是 api/%date:yyyyMMdd%"
-        )
-    expected_settings = {
-        "file_format": "webp",
-        "lossless_webp": False,
-        "quality": 95,
-        "embed_workflow": True,
-        "save_with_metadata": True,
-        "add_counter_to_filename": True,
-        "save_as_recipe": False,
-    }
-    for name, expected in expected_settings.items():
-        if inputs.get(name) != expected:
-            raise RuntimeError(
-                f"API Output.inputs.{name} 必须是 {json.dumps(expected)}"
-            )
-    try:
-        json.dumps(data)
-    except (TypeError, ValueError) as error:
-        raise RuntimeError("工作流必须能够序列化") from error
-
-    return WorkflowTemplate(copy.deepcopy(data), instruction_id, output_id, prefix)
+    output_id, _ = unique_node("API Output")
+    return WorkflowTemplate(data, instruction_id, output_id)
 
 
 def build_prompt(template: WorkflowTemplate, instruction: str) -> dict[str, Any]:

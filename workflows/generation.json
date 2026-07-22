@@ -73,7 +73,7 @@
   },
   "385": {
     "inputs": {
-      "text": "\nspreading own pussy\n\n\ncowboy shot, from below, from side\n\n\nhina \\(dress\\) \\(blue archive\\), (mature:-1), aged down\ndemon girl, demon wings, demon horns, halo\n\n\nofficial alternate hairstyle\nwhite hair, hair up\npurple eyes, half-closed eyes\nseductive smile, parted lips, head tilt\n\n\nsee-through clothes\nlong purple puffy lace dress\nbare shoulders, elbow gloves, necklace\n\n\nribs, sideboob, small breasts, soft breasts, one breasts out\npussy, vaginal, thigh gap\npussy juice trail, pussy juice stain\n\n\n(simple background:-1.25)\nballroom, champagne flute, large windows, waiter in backgroud\n\n\n(lineart, flat color, anime coloring:2)\nrim light, light particles, cinematic lighting\ndepth of field, strong perspective, blurry background",
+      "text": "",
       "clip": [
         "717",
         1
@@ -110,7 +110,7 @@
   },
   "693": {
     "inputs": {
-      "unet_name": "anima\\anima_aesthetic_v1.1_rdbt_v12_simple_int8mixed_rowwise.safetensors",
+      "unet_name": "anima\\anima_turboV10_simple_int8mixed_rowwise.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
@@ -120,7 +120,7 @@
   },
   "708": {
     "inputs": {
-      "unet_name": "anima\\rdbtAnima_b1V12_simple_int8mixed_rowwise.safetensors",
+      "unet_name": "anima\\anima_aesthetic_v1.1_rdbt_v12_simple_int8mixed_rowwise.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
@@ -186,7 +186,7 @@
   },
   "873": {
     "inputs": {
-      "text1": "<lora:Style\\sky07v1:0.25>\n<lora:Style\\anima_rendering_detailer_base10:-0.25>"
+      "text1": "<lora:Style\\sky07v1:0.25>\n<lora:Style\\gpt-image-2_anima-base1_v1-1:0.25>"
     },
     "class_type": "TextBox1",
     "_meta": {

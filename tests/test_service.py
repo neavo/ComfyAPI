@@ -17,18 +17,7 @@ def workflow_data() -> dict[str, object]:
             "_meta": {"title": "API Instruction"},
         },
         "20": {
-            "inputs": {
-                "filename_prefix": "api/%date:yyyyMMdd%",
-                "file_format": "webp",
-                "lossless_webp": False,
-                "quality": 95,
-                "embed_workflow": True,
-                "save_with_metadata": True,
-                "add_counter_to_filename": True,
-                "save_as_recipe": False,
-                "images": ["2", 0],
-            },
-            "class_type": "Save Image (LoraManager)",
+            "inputs": {"images": ["2", 0]},
             "_meta": {"title": "API Output"},
         },
     }
@@ -144,9 +133,11 @@ def test_llm_preprocessing_uses_openai_chat_completions_format() -> None:
         result
         == """a rainy neon street
 
+safe
+(mature:-1), (aged down:1)
 (simple background:-1.25)
-(lineart, flat color, anime coloring:1.5)
-dutch angle, dynamic angle
+(shiny skin:-1)
+(flat color, anime coloring:2)
 rim light, light particles, cinematic lighting
 depth of field, strong perspective, blurry background"""
     )
@@ -264,34 +255,17 @@ def test_llm_permanent_or_damaged_response_is_not_retried(failure: int | str) ->
 
 
 def test_unique_workflow_markers_are_resolved() -> None:
-    template = service.validate_workflow(workflow_data())
+    template = service.resolve_workflow(workflow_data())
 
     assert template.instruction_node_id == "10"
     assert template.output_node_id == "20"
-    assert template.filename_prefix == "api/%date:yyyyMMdd%"
 
 
-def test_committed_workflow_satisfies_runtime_contract() -> None:
+def test_committed_workflow_can_build_prompt() -> None:
     template = service.load_workflow()
+    prompt = service.build_prompt(template, "生成雨夜街道")
 
-    assert (
-        template.data[template.instruction_node_id]["_meta"]["title"]
-        == "API Instruction"
-    )
-    assert template.data[template.output_node_id]["_meta"]["title"] == "API Output"
-    assert template.filename_prefix == "api/%date:yyyyMMdd%"
-    expected = workflow_data()["20"]["inputs"]
-    actual = template.data[template.output_node_id]["inputs"]
-    assert {name: actual[name] for name in expected if name != "images"} == {
-        name: value for name, value in expected.items() if name != "images"
-    }
-    assert (
-        sum(
-            node["class_type"] == "Save Image (LoraManager)"
-            for node in template.data.values()
-        )
-        == 1
-    )
+    assert prompt[template.instruction_node_id]["inputs"]["text"] == "生成雨夜街道"
 
 
 @pytest.mark.parametrize("title", ["API Instruction", "API Output"])
@@ -302,7 +276,7 @@ def test_missing_workflow_marker_stops_startup(title: str) -> None:
             node["_meta"]["title"] = "缺失标记"
 
     with pytest.raises(RuntimeError, match=title):
-        service.validate_workflow(data)
+        service.resolve_workflow(data)
 
 
 @pytest.mark.parametrize("title", ["API Instruction", "API Output"])
@@ -312,50 +286,19 @@ def test_duplicate_workflow_marker_stops_startup(title: str) -> None:
     data["30"] = copy.deepcopy(source)
 
     with pytest.raises(RuntimeError, match=title):
-        service.validate_workflow(data)
+        service.resolve_workflow(data)
 
 
-def test_output_marker_must_be_lora_manager_saver() -> None:
+def test_instruction_marker_requires_text_input() -> None:
     data = workflow_data()
-    data["20"]["class_type"] = "PreviewImage"
+    del data["10"]["inputs"]["text"]
 
-    with pytest.raises(RuntimeError, match="Save Image"):
-        service.validate_workflow(data)
-
-
-@pytest.mark.parametrize("prefix", ["   ", "api/result"])
-def test_output_prefix_must_use_daily_api_pattern(prefix: str) -> None:
-    data = workflow_data()
-    data["20"]["inputs"]["filename_prefix"] = prefix
-
-    with pytest.raises(RuntimeError, match="filename_prefix"):
-        service.validate_workflow(data)
-
-
-@pytest.mark.parametrize(
-    ("setting", "invalid"),
-    [
-        ("file_format", "png"),
-        ("lossless_webp", True),
-        ("quality", 90),
-        ("embed_workflow", False),
-        ("save_with_metadata", False),
-        ("add_counter_to_filename", False),
-        ("save_as_recipe", True),
-    ],
-)
-def test_output_settings_must_match_webp_contract(
-    setting: str, invalid: object
-) -> None:
-    data = workflow_data()
-    data["20"]["inputs"][setting] = invalid
-
-    with pytest.raises(RuntimeError, match=setting):
-        service.validate_workflow(data)
+    with pytest.raises(RuntimeError, match="inputs.text"):
+        service.resolve_workflow(data)
 
 
 def test_build_prompt_only_changes_instruction() -> None:
-    template = service.validate_workflow(workflow_data())
+    template = service.resolve_workflow(workflow_data())
     original = copy.deepcopy(template.data)
 
     prompt = service.build_prompt(template, "生成雨夜街道")
@@ -444,7 +387,7 @@ def generation_service(
         client,
         llm_settings(),
         "系统指令",
-        service.validate_workflow(workflow_data()),
+        service.resolve_workflow(workflow_data()),
     )
 
 
