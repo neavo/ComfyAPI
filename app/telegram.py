@@ -14,7 +14,7 @@ QUEUE_CAPACITY = 20
 RECONNECT_DELAY = 3.0
 JOB_TIMEOUT = 180.0
 OUTBOUND_ATTEMPTS = 3
-RESULT_POLL_DELAYS = (2.0, 3.0, 5.0)
+RESULT_POLL_DELAY = 3.0
 TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
 GENERATION_API_URL = "http://127.0.0.1:48188"
 # ponytail: 与 app_api.bat 的同机固定端口重复；需要远程或多环境部署时再改成单一配置源。
@@ -398,8 +398,8 @@ class TelegramBot:
         job_id: str | None = None
         try:
             job_id = await self.generation.submit(job.instruction)
-            delay_index = 0
             while True:
+                await asyncio.sleep(RESULT_POLL_DELAY)
                 try:
                     result = await self.generation.result(job_id)
                 except TransientGenerationApiError as error:
@@ -414,19 +414,14 @@ class TelegramBot:
                     )
                 if result is not None:
                     break
-                delay = RESULT_POLL_DELAYS[
-                    min(delay_index, len(RESULT_POLL_DELAYS) - 1)
-                ]
-                delay_index += 1
                 LOGGER.info(
                     "生成 API 尚无结果：chat_id=%s message_id=%s job_id=%s，"
                     "%.1f 秒后重试",
                     job.chat_id,
                     job.message_id,
                     job_id,
-                    delay,
+                    RESULT_POLL_DELAY,
                 )
-                await asyncio.sleep(delay)
         except GenerationApiError as error:
             LOGGER.error(
                 "Telegram 生成 API 任务失败：chat_id=%s message_id=%s "
@@ -484,7 +479,7 @@ async def main() -> None:
         httpx.AsyncClient(
             base_url=GENERATION_API_URL,
             headers={"Authorization": f"Bearer {api_token}"},
-            timeout=httpx.Timeout(30.0, connect=5.0),
+            timeout=httpx.Timeout(JOB_TIMEOUT, connect=5.0),
         ) as generation_client,
         httpx.AsyncClient(
             base_url="https://api.telegram.org",

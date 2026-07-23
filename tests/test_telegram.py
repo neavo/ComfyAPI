@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+from unittest.mock import patch
 from uuid import UUID
 
 import httpx
@@ -216,12 +217,13 @@ class FakeGeneration:
         return result
 
 
-async def drain_queue(bot: TelegramBot) -> None:
-    worker = asyncio.create_task(bot.worker(1))
-    await asyncio.wait_for(bot.queue.join(), 1)
-    worker.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await worker
+async def drain_queue(bot: TelegramBot, poll_delay: float = 0) -> None:
+    with patch("app.telegram.RESULT_POLL_DELAY", poll_delay):
+        worker = asyncio.create_task(bot.worker(1))
+        await asyncio.wait_for(bot.queue.join(), 1)
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
 
 
 @pytest.mark.parametrize(
@@ -491,21 +493,24 @@ def test_failed_processing_notice_does_not_prevent_generation() -> None:
     assert len(api.photos) == 1
 
 
-def test_missing_or_transient_history_uses_two_three_five_five_delays(
+def test_result_polling_waits_three_seconds_before_every_query(
     monkeypatch,
 ) -> None:
-    sleeps: list[float] = []
+    events: list[tuple[str, object]] = []
 
     async def record_sleep(delay: float) -> None:
-        sleeps.append(delay)
+        events.append(("等待", delay))
+
+    class ObservedGeneration(FakeGeneration):
+        async def result(self, job_id: str) -> GenerationResult | None:
+            events.append(("查询", job_id))
+            return await super().result(job_id)
 
     monkeypatch.setattr(asyncio, "sleep", record_sleep)
-    generation = FakeGeneration(
+    generation = ObservedGeneration(
         [
             None,
             TransientGenerationApiError("短暂失败"),
-            None,
-            None,
             GenerationResult("completed", b"WEBP", "image/webp"),
         ]
     )
@@ -513,10 +518,17 @@ def test_missing_or_transient_history_uses_two_three_five_five_delays(
     async def run() -> None:
         bot = TelegramBot(FakeApi(), generation)
         await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
-        await drain_queue(bot)
+        await drain_queue(bot, poll_delay=3.0)
 
     asyncio.run(run())
-    assert sleeps == [2.0, 3.0, 5.0, 5.0]
+    assert events == [
+        ("等待", 3.0),
+        ("查询", "job-1"),
+        ("等待", 3.0),
+        ("查询", "job-1"),
+        ("等待", 3.0),
+        ("查询", "job-1"),
+    ]
 
 
 @pytest.mark.parametrize(
