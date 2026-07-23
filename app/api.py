@@ -75,25 +75,15 @@ async def new_job(
 
 
 @router.get("/result/{id}")
-async def result(id: str, request: Request, _: None = Depends(authenticate)):
-    try:
-        parsed = UUID(id)
-    except ValueError as error:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid canonical UUID"
-        ) from error
-    if str(parsed) != id:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid canonical UUID"
-        )
-
+async def result(id: UUID, request: Request, _: None = Depends(authenticate)):
+    job_id = str(id)
     generation: GenerationService = request.app.state.generation
     try:
-        output = await generation.result(id)
+        output = await generation.result(job_id)
     except UpstreamError as error:
-        LOGGER.error("任务 %s 查询失败：%s", id, error)
+        LOGGER.error("任务 %s 查询失败：%s", job_id, error)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, UPSTREAM_DETAIL) from error
-    LOGGER.info("任务 %s 状态：%s", id, output.status)
+    LOGGER.info("任务 %s 状态：%s", job_id, output.status)
     if output.status == "processing":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Task is still processing")
     if output.status == "completed":

@@ -2,13 +2,12 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-from uuid import UUID
+from typing import Any, Literal
 
 import httpx
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from .service import PROJECT_ROOT, read_required
+
 WORKER_COUNT = 2
 QUEUE_CAPACITY = 20
 RECONNECT_DELAY = 3.0
@@ -17,7 +16,6 @@ OUTBOUND_ATTEMPTS = 3
 RESULT_POLL_DELAY = 3.0
 TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
 GENERATION_API_URL = "http://127.0.0.1:48188"
-# ponytail: 与 app_api.bat 的同机固定端口重复；需要远程或多环境部署时再改成单一配置源。
 LOGGER = logging.getLogger(__name__)
 
 
@@ -52,20 +50,9 @@ def extract_instruction(text: str, username: str) -> str | None:
     return text[len(mention) :].strip()
 
 
-def load_config(name: str) -> str:
-    path = PROJECT_ROOT / "config" / name
-    try:
-        value = path.read_text(encoding="utf-8-sig").strip()
-    except (OSError, UnicodeError) as error:
-        raise RuntimeError(f"无法读取配置文件 {path.name}: {error}") from error
-    if not value or "\n" in value or "\r" in value:
-        raise RuntimeError(f"配置文件 {path.name} 必须包含单行非空内容")
-    return value
-
-
 @dataclass(frozen=True, slots=True)
 class GenerationResult:
-    status: str
+    status: Literal["completed", "failed"]
     image: bytes | None = None
     media_type: str | None = None
 
@@ -90,16 +77,11 @@ class GenerationApi:
         if response.status_code != 202:
             raise GenerationApiError(f"提交响应异常：HTTP {response.status_code}")
         try:
-            payload = response.json()
-        except ValueError:
-            raise GenerationApiError("提交响应不是合法 JSON") from None
-        job_id = payload.get("id") if isinstance(payload, dict) else None
-        try:
-            valid = isinstance(job_id, str) and str(UUID(job_id)) == job_id
-        except ValueError:
-            valid = False
-        if not valid:
-            raise GenerationApiError("提交响应缺少规范 UUID")
+            job_id = response.json()["id"]
+        except (ValueError, KeyError, TypeError):
+            raise GenerationApiError("提交响应缺少任务 ID") from None
+        if not isinstance(job_id, str):
+            raise GenerationApiError("提交响应缺少任务 ID")
         return job_id
 
     async def result(self, job_id: str) -> GenerationResult | None:
@@ -117,16 +99,9 @@ class GenerationApi:
             )
         if response.status_code == 502:
             raise TransientGenerationApiError("查询响应异常：HTTP 502")
-        try:
-            payload = response.json()
-        except ValueError:
-            raise GenerationApiError("查询响应不是合法 JSON") from None
-        detail = payload.get("detail") if isinstance(payload, dict) else None
-        if response.status_code == 400 and detail == "Task is still processing":
+        if response.status_code in {400, 404}:
             return None
-        if response.status_code == 404 and detail == "Task not found":
-            return None
-        if response.status_code == 500 and detail == "generation failed":
+        if response.status_code == 500:
             return GenerationResult("failed")
         raise GenerationApiError(f"查询响应异常：HTTP {response.status_code}")
 
@@ -136,11 +111,12 @@ class TelegramApi:
         self.token = token
         self.client = client
 
-    async def get_me(self) -> dict[str, Any]:
+    async def get_username(self) -> str:
         result = await self._call("getMe")
-        if not isinstance(result, dict):
-            raise TelegramError("getMe 响应缺少机器人信息", retryable=True)
-        return result
+        username = result.get("username") if isinstance(result, dict) else None
+        if not isinstance(username, str) or not username:
+            raise TelegramError("getMe 响应缺少机器人用户名", retryable=True)
+        return username
 
     async def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
         data = {"timeout": "30", "allowed_updates": json.dumps(["message"])}
@@ -199,7 +175,6 @@ class TelegramApi:
                     delay,
                 )
                 await asyncio.sleep(delay)
-        raise AssertionError("Telegram 出站重试循环未返回")
 
     async def _call(
         self,
@@ -224,17 +199,6 @@ class TelegramApi:
             )
             raise TelegramError("响应不是合法 JSON", retryable=retryable) from error
 
-        parameters = payload.get("parameters") if isinstance(payload, dict) else None
-        raw_retry_after = (
-            parameters.get("retry_after") if isinstance(parameters, dict) else None
-        )
-        retry_after = (
-            float(raw_retry_after)
-            if isinstance(raw_retry_after, (int, float))
-            and not isinstance(raw_retry_after, bool)
-            and raw_retry_after >= 0
-            else None
-        )
         description = payload.get("description") if isinstance(payload, dict) else None
         message = (
             description
@@ -242,19 +206,23 @@ class TelegramApi:
             else f"HTTP {response.status_code}"
         )
 
-        if response.status_code == 429 or retry_after is not None:
+        if response.status_code == 429:
+            parameters = (
+                payload.get("parameters") if isinstance(payload, dict) else None
+            )
+            retry_after = (
+                parameters.get("retry_after") if isinstance(parameters, dict) else None
+            )
+            if not isinstance(retry_after, (int, float)) or retry_after < 0:
+                retry_after = None
             raise TelegramError(message, retryable=True, retry_after=retry_after)
         if response.status_code in TRANSIENT_STATUS_CODES:
             raise TelegramError(message, retryable=True)
-        if response.is_error:
-            raise TelegramError(message)
         if (
-            not isinstance(payload, dict)
-            or "ok" not in payload
-            or "result" not in payload
+            response.is_error
+            or not isinstance(payload, dict)
+            or payload.get("ok") is not True
         ):
-            raise TelegramError("响应缺少 Bot API 状态", retryable=True)
-        if payload.get("ok") is not True:
             raise TelegramError(message)
         return payload.get("result")
 
@@ -276,11 +244,7 @@ class TelegramBot:
     async def _username(self) -> str:
         while True:
             try:
-                identity = await self.api.get_me()
-                username = identity.get("username")
-                if not isinstance(username, str) or not username:
-                    raise TelegramError("getMe 响应缺少机器人用户名", retryable=True)
-                return username
+                return await self.api.get_username()
             except TelegramError as error:
                 if not error.retryable:
                     raise
@@ -490,8 +454,9 @@ class TelegramBot:
 
 
 async def main() -> None:
-    telegram_token = load_config("tg_bot_token.txt")
-    api_token = load_config("api_token.txt")
+    config = PROJECT_ROOT / "config"
+    telegram_token = read_required(config / "tg_bot_token.txt")
+    api_token = read_required(config / "api_token.txt")
     async with (
         httpx.AsyncClient(
             base_url=GENERATION_API_URL,

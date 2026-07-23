@@ -6,7 +6,6 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -29,10 +28,6 @@ TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class UpstreamError(RuntimeError):
-    pass
-
-
-class TransientUpstreamError(UpstreamError):
     pass
 
 
@@ -83,7 +78,6 @@ class GenerationService:
         self.workflow = workflow
 
     async def submit(self, instruction: str) -> str:
-        instruction = normalize_instruction(instruction)
         job_id = str(uuid4())
         if PASSTHROUGH_MARKER in instruction:
             instruction = normalize_instruction(
@@ -104,28 +98,18 @@ class GenerationService:
         return job_id
 
     async def result(self, job_id: str) -> GenerationResult:
-        status, files = await query_history(self.comfy_client, self.workflow, job_id)
-        if status is None:
-            status = await query_queue(self.comfy_client, job_id)
-        if status != "completed":
-            return GenerationResult(status)
-        return await read_result_image(self.comfy_client, files)
-
-    async def history_result(self, job_id: str) -> GenerationResult | None:
-        status, files = await query_history(self.comfy_client, self.workflow, job_id)
-        if status is None:
-            return None
-        if status == "failed":
+        history = await query_history(self.comfy_client, self.workflow, job_id)
+        if history == "failed":
             return GenerationResult("failed")
-        return await read_result_image(self.comfy_client, files)
+        if history is None:
+            return GenerationResult(await query_queue(self.comfy_client, job_id))
+        return await read_result_image(self.comfy_client, history)
 
 
 async def read_result_image(
-    client: httpx.AsyncClient, files: list[dict[str, str]] | None
+    client: httpx.AsyncClient, file: dict[str, str]
 ) -> GenerationResult:
-    if not files:
-        raise UpstreamError("完成任务缺少图片文件")
-    image = await get_upstream(client, "/view", params=files[0])
+    image = await get_upstream(client, "/view", params=file)
     return GenerationResult(
         "completed", image.content, image.headers.get("content-type", "image/webp")
     )
@@ -138,7 +122,7 @@ def normalize_instruction(value: str) -> str:
     return value
 
 
-def _read_required(path: Path) -> str:
+def read_required(path: Path) -> str:
     try:
         value = path.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeError) as error:
@@ -151,45 +135,34 @@ def _read_required(path: Path) -> str:
 def load_settings(root: Path | None = None) -> Settings:
     root = PROJECT_ROOT if root is None else root
     config = root / "config"
-    token = _read_required(config / "api_token.txt")
-    url = _read_required(config / "comfy_url.txt").rstrip("/")
-    llm_url = _read_required(config / "llm_url.txt")
-    llm_api_key = _read_required(config / "llm_api_key.txt")
-    llm_model = _read_required(config / "llm_model.txt")
+    token = read_required(config / "api_token.txt")
+    comfy_url = _http_url(
+        "comfy_url.txt", read_required(config / "comfy_url.txt"), True
+    )
+    llm_url = _http_url("llm_url.txt", read_required(config / "llm_url.txt"))
+    return Settings(
+        token,
+        comfy_url,
+        llm_url,
+        read_required(config / "llm_api_key.txt"),
+        read_required(config / "llm_model.txt"),
+    )
+
+
+def _http_url(name: str, value: str, root: bool = False) -> str:
     try:
-        parsed = urlsplit(url)
-        parsed.port
-    except ValueError as error:
-        raise RuntimeError("comfy_url.txt 不是合法 URL") from error
+        url = httpx.URL(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{name} 不是合法 URL") from error
     if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path
-        or parsed.query
-        or parsed.fragment
-        or any(character.isspace() for character in url)
+        url.scheme not in {"http", "https"}
+        or not url.host
+        or url.userinfo
+        or (root and url.path != "/")
     ):
-        raise RuntimeError(
-            "comfy_url.txt 必须是无用户信息、路径、查询和片段的 HTTP/HTTPS 根 URL"
-        )
-    try:
-        parsed_llm = urlsplit(llm_url)
-        parsed_llm.port
-    except ValueError as error:
-        raise RuntimeError("llm_url.txt 不是合法 URL") from error
-    if (
-        parsed_llm.scheme not in {"http", "https"}
-        or not parsed_llm.hostname
-        or parsed_llm.username is not None
-        or parsed_llm.password is not None
-        or parsed_llm.query
-        or parsed_llm.fragment
-        or any(character.isspace() for character in llm_url)
-    ):
-        raise RuntimeError("llm_url.txt 必须是无用户信息、查询和片段的 HTTP/HTTPS URL")
-    return Settings(token, url, llm_url, llm_api_key, llm_model)
+        kind = "根 URL" if root else "URL"
+        raise RuntimeError(f"{name} 必须是无用户信息的 HTTP/HTTPS {kind}")
+    return str(url).rstrip("/") if root else str(url)
 
 
 def load_system_prompt(path: Path | None = None) -> str:
@@ -248,11 +221,7 @@ def build_prompt(template: WorkflowTemplate, instruction: str) -> dict[str, Any]
 
 def _randomize_seeds(prompt: dict[str, Any]) -> None:
     for node in prompt.values():
-        if not isinstance(node, dict):
-            continue
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            continue
+        inputs = node.get("inputs", {})
         if "noise_seed" in inputs:
             inputs["noise_seed"] = random.randint(0, 2**63 - 1)
         if "seed" in inputs:
@@ -263,17 +232,17 @@ def parse_history(
     history: object,
     job_id: str,
     output_node_id: str,
-) -> tuple[Literal["completed", "failed"] | None, list[dict[str, str]] | None]:
+) -> dict[str, str] | Literal["failed"] | None:
     if not isinstance(history, dict):
         raise UpstreamError("history 响应不是对象")
     if job_id not in history:
-        return None, None
+        return None
     record = history[job_id]
     if not isinstance(record, dict) or not isinstance(record.get("status"), dict):
         raise UpstreamError("history 任务结构损坏")
     status = record["status"].get("status_str")
     if status == "error":
-        return "failed", None
+        return "failed"
     if status != "success":
         raise UpstreamError("history 任务状态未知")
 
@@ -282,27 +251,21 @@ def parse_history(
     images = output.get("images") if isinstance(output, dict) else None
     if not isinstance(images, list):
         raise UpstreamError("成功任务缺少 API Output images")
-    files: list[dict[str, str]] = []
     for image in images:
         if not isinstance(image, dict):
             raise UpstreamError("图片元数据结构损坏")
         if image.get("type") != "output":
             continue
         if not all(
-            isinstance(image.get(field), str)
-            for field in ("filename", "subfolder", "type")
+            isinstance(image.get(field), str) for field in ("filename", "subfolder")
         ):
             raise UpstreamError("图片元数据字段损坏")
-        files.append(
-            {
-                "filename": image["filename"],
-                "subfolder": image["subfolder"].replace("\\", "/"),
-                "type": image["type"],
-            }
-        )
-    if not files:
-        raise UpstreamError("成功任务没有 output 文件")
-    return "completed", files
+        return {
+            "filename": image["filename"],
+            "subfolder": image["subfolder"].replace("\\", "/"),
+            "type": "output",
+        }
+    raise UpstreamError("成功任务没有 output 文件")
 
 
 def is_queued(queue: object, job_id: str) -> bool:
@@ -380,7 +343,6 @@ async def preprocess_instruction(
             RETRY_DELAY,
         )
         await asyncio.sleep(RETRY_DELAY)
-    raise AssertionError("LLM 重试循环未返回")
 
 
 async def submit_prompt(
@@ -424,11 +386,9 @@ async def get_upstream(
     try:
         response = await client.get(path, params=params)
     except httpx.RequestError as error:
-        raise TransientUpstreamError(
-            f"GET {path} 请求失败: {type(error).__name__}"
-        ) from error
+        raise UpstreamError(f"GET {path} 请求失败: {type(error).__name__}") from error
     if response.status_code in TRANSIENT_STATUS_CODES:
-        raise TransientUpstreamError(f"GET {path} 返回 HTTP {response.status_code}")
+        raise UpstreamError(f"GET {path} 返回 HTTP {response.status_code}")
     if response.is_error:
         raise UpstreamError(f"GET {path} 返回 HTTP {response.status_code}")
     return response
@@ -438,7 +398,7 @@ async def query_history(
     client: httpx.AsyncClient,
     template: WorkflowTemplate,
     job_id: str,
-) -> tuple[Literal["completed", "failed"] | None, list[dict[str, str]] | None]:
+) -> dict[str, str] | Literal["failed"] | None:
     response = await get_upstream(client, f"/history/{job_id}")
     return parse_history(
         _json(response, "GET /history"), job_id, template.output_node_id
