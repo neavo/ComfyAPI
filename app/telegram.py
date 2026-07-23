@@ -4,28 +4,20 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 
-from .service import (
-    LLM_ATTEMPTS as SERVICE_LLM_ATTEMPTS,
-    PROJECT_ROOT,
-    GenerationService,
-    TransientUpstreamError,
-    UpstreamError,
-    load_settings,
-    load_system_prompt,
-    load_workflow,
-)
-
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WORKER_COUNT = 2
 QUEUE_CAPACITY = 20
 RECONNECT_DELAY = 3.0
 JOB_TIMEOUT = 180.0
 OUTBOUND_ATTEMPTS = 3
-LLM_ATTEMPTS = SERVICE_LLM_ATTEMPTS
 RESULT_POLL_DELAYS = (2.0, 3.0, 5.0)
 TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
+GENERATION_API_URL = "http://127.0.0.1:48188"
+# ponytail: 与 app_api.bat 的同机固定端口重复；需要远程或多环境部署时再改成单一配置源。
 LOGGER = logging.getLogger(__name__)
 
 
@@ -60,15 +52,83 @@ def extract_instruction(text: str, username: str) -> str | None:
     return text[len(mention) :].strip()
 
 
-def load_bot_token(path: Path | None = None) -> str:
-    path = PROJECT_ROOT / "config" / "tg_bot_token.txt" if path is None else path
+def load_config(name: str) -> str:
+    path = PROJECT_ROOT / "config" / name
     try:
-        token = path.read_text(encoding="utf-8-sig").strip()
+        value = path.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeError) as error:
         raise RuntimeError(f"无法读取配置文件 {path.name}: {error}") from error
-    if not token or "\n" in token or "\r" in token:
+    if not value or "\n" in value or "\r" in value:
         raise RuntimeError(f"配置文件 {path.name} 必须包含单行非空内容")
-    return token
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationResult:
+    status: str
+    image: bytes | None = None
+    media_type: str | None = None
+
+
+class GenerationApiError(RuntimeError):
+    pass
+
+
+class TransientGenerationApiError(GenerationApiError):
+    pass
+
+
+class GenerationApi:
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self.client = client
+
+    async def submit(self, instruction: str) -> str:
+        try:
+            response = await self.client.post("/new", json={"instruction": instruction})
+        except httpx.RequestError as error:
+            raise GenerationApiError(f"提交请求失败：{type(error).__name__}") from None
+        if response.status_code != 202:
+            raise GenerationApiError(f"提交响应异常：HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GenerationApiError("提交响应不是合法 JSON") from None
+        job_id = payload.get("id") if isinstance(payload, dict) else None
+        try:
+            valid = isinstance(job_id, str) and str(UUID(job_id)) == job_id
+        except ValueError:
+            valid = False
+        if not valid:
+            raise GenerationApiError("提交响应缺少规范 UUID")
+        return job_id
+
+    async def result(self, job_id: str) -> GenerationResult | None:
+        try:
+            response = await self.client.get(f"/result/{job_id}")
+        except httpx.RequestError as error:
+            raise TransientGenerationApiError(
+                f"查询请求失败：{type(error).__name__}"
+            ) from None
+        if response.status_code == 200:
+            if not response.content:
+                raise GenerationApiError("完成响应图片为空")
+            return GenerationResult(
+                "completed", response.content, response.headers.get("content-type")
+            )
+        if response.status_code == 502:
+            raise TransientGenerationApiError("查询响应异常：HTTP 502")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GenerationApiError("查询响应不是合法 JSON") from None
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        if response.status_code == 400 and detail == "Task is still processing":
+            return None
+        if response.status_code == 404 and detail == "Task not found":
+            return None
+        if response.status_code == 500 and detail == "generation failed":
+            return GenerationResult("failed")
+        raise GenerationApiError(f"查询响应异常：HTTP {response.status_code}")
 
 
 class TelegramApi:
@@ -200,7 +260,7 @@ class TelegramApi:
 
 
 class TelegramBot:
-    def __init__(self, api: TelegramApi, generation: GenerationService) -> None:
+    def __init__(self, api: TelegramApi, generation: GenerationApi) -> None:
         self.api = api
         self.generation = generation
         self.queue: asyncio.Queue[TelegramJob] = asyncio.Queue(QUEUE_CAPACITY)
@@ -341,11 +401,11 @@ class TelegramBot:
             delay_index = 0
             while True:
                 try:
-                    result = await self.generation.history_result(job_id)
-                except TransientUpstreamError as error:
+                    result = await self.generation.result(job_id)
+                except TransientGenerationApiError as error:
                     result = None
                     LOGGER.warning(
-                        "ComfyUI 历史查询瞬时失败：chat_id=%s message_id=%s "
+                        "生成 API 查询瞬时失败：chat_id=%s message_id=%s "
                         "job_id=%s error=%s",
                         job.chat_id,
                         job.message_id,
@@ -359,7 +419,7 @@ class TelegramBot:
                 ]
                 delay_index += 1
                 LOGGER.info(
-                    "ComfyUI 历史尚无结果：chat_id=%s message_id=%s job_id=%s，"
+                    "生成 API 尚无结果：chat_id=%s message_id=%s job_id=%s，"
                     "%.1f 秒后重试",
                     job.chat_id,
                     job.message_id,
@@ -367,9 +427,10 @@ class TelegramBot:
                     delay,
                 )
                 await asyncio.sleep(delay)
-        except UpstreamError as error:
+        except GenerationApiError as error:
             LOGGER.error(
-                "Telegram 上游任务失败：chat_id=%s message_id=%s job_id=%s error=%s",
+                "Telegram 生成 API 任务失败：chat_id=%s message_id=%s "
+                "job_id=%s error=%s",
                 job.chat_id,
                 job.message_id,
                 job_id,
@@ -388,7 +449,7 @@ class TelegramBot:
             )
             return
         if result.status != "completed" or result.image is None:
-            raise RuntimeError(f"history_result 返回意外状态：{result.status}")
+            raise RuntimeError(f"result 返回意外状态：{result.status}")
         delivered = await self.api.send_photo(
             reply, result.image, result.media_type or "image/webp"
         )
@@ -417,26 +478,23 @@ class TelegramBot:
 
 
 async def main() -> None:
-    token = load_bot_token()
-    settings = load_settings()
-    system_prompt = load_system_prompt()
-    workflow = load_workflow()
+    telegram_token = load_config("tg_bot_token.txt")
+    api_token = load_config("api_token.txt")
     async with (
-        httpx.AsyncClient(base_url=settings.comfy_url, timeout=5.0) as comfy_client,
-        httpx.AsyncClient(timeout=60.0) as llm_client,
+        httpx.AsyncClient(
+            base_url=GENERATION_API_URL,
+            headers={"Authorization": f"Bearer {api_token}"},
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        ) as generation_client,
         httpx.AsyncClient(
             base_url="https://api.telegram.org",
             timeout=httpx.Timeout(40.0, connect=10.0),
         ) as telegram_client,
     ):
-        generation = GenerationService(
-            comfy_client,
-            llm_client,
-            settings,
-            system_prompt,
-            workflow,
-        )
-        await TelegramBot(TelegramApi(token, telegram_client), generation).run()
+        await TelegramBot(
+            TelegramApi(telegram_token, telegram_client),
+            GenerationApi(generation_client),
+        ).run()
 
 
 if __name__ == "__main__":

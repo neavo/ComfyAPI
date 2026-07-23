@@ -1,11 +1,15 @@
 import asyncio
 import contextlib
+from uuid import UUID
 
 import httpx
 import pytest
 
-from app.service import GenerationResult, TransientUpstreamError
 from app.telegram import (
+    GenerationApi,
+    GenerationApiError,
+    GenerationResult,
+    TransientGenerationApiError,
     JOB_TIMEOUT,
     QUEUE_CAPACITY,
     TelegramApi,
@@ -14,6 +18,139 @@ from app.telegram import (
     TelegramJob,
     extract_instruction,
 )
+
+JOB_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+
+def test_generation_api_submit_sends_exact_authenticated_request() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/new"
+        assert request.headers["authorization"] == "Bearer TOKEN"
+        assert request.read() == b'{"instruction":"\xe7\x94\xbb\xe4\xb8\x80\xe5\x8f\xaa\xe7\x8c\xab"}'
+        return httpx.Response(202, json={"id": JOB_ID})
+
+    async def run() -> str:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:48188",
+            headers={"Authorization": "Bearer TOKEN"},
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            return await GenerationApi(client).submit("画一只猫")
+
+    assert asyncio.run(run()) == JOB_ID
+    assert str(UUID(JOB_ID)) == JOB_ID
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "headers", "expected"),
+    [
+        (200, b"WEBP", {"content-type": "image/webp"}, "completed"),
+        (400, b'{"detail":"Task is still processing"}', {}, None),
+        (404, b'{"detail":"Task not found"}', {}, None),
+        (500, b'{"detail":"generation failed"}', {}, "failed"),
+    ],
+)
+def test_generation_api_result_maps_public_protocol(
+    status: int,
+    body: bytes,
+    headers: dict[str, str],
+    expected: str | None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == f"/result/{JOB_ID}"
+        assert request.headers["authorization"] == "Bearer TOKEN"
+        return httpx.Response(status, content=body, headers=headers)
+
+    async def run():
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:48188",
+            headers={"Authorization": "Bearer TOKEN"},
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            return await GenerationApi(client).result(JOB_ID)
+
+    result = asyncio.run(run())
+    assert (result.status if result is not None else None) == expected
+    if expected == "completed":
+        assert result.image == b"WEBP"
+        assert result.media_type == "image/webp"
+
+
+@pytest.mark.parametrize("failure", [502, "network"])
+def test_generation_api_result_treats_upstream_failures_as_transient(
+    failure: int | str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure == "network":
+            raise httpx.ConnectError("连接失败", request=request)
+        return httpx.Response(502, json={"detail": "ComfyUI upstream error"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:48188",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with pytest.raises(TransientGenerationApiError):
+                await GenerationApi(client).result(JOB_ID)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("operation", "status", "body"),
+    [
+        ("submit", 202, b'{"id":"not-a-uuid"}'),
+        ("submit", 202, b"{}"),
+        ("submit", 202, b"not-json"),
+        ("submit", 401, b'{"detail":"Unauthorized"}'),
+        ("submit", 502, b'{"detail":"upstream"}'),
+        ("result", 200, b""),
+        ("result", 401, b'{"detail":"Unauthorized"}'),
+        ("result", 400, b"not-json"),
+        ("result", 400, b'{"detail":"unknown"}'),
+        ("result", 404, b'{"detail":"unknown"}'),
+        ("result", 418, b'{"detail":"unknown"}'),
+        ("result", 503, b'{"detail":"unknown"}'),
+    ],
+)
+def test_generation_api_rejects_damaged_or_unknown_protocol(
+    operation: str, status: int, body: bytes
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=body)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:48188",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            api = GenerationApi(client)
+            with pytest.raises(GenerationApiError):
+                await getattr(api, operation)("画猫" if operation == "submit" else JOB_ID)
+
+    asyncio.run(run())
+
+
+def test_generation_api_submit_network_failure_is_not_retried() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("连接失败", request=request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:48188",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with pytest.raises(GenerationApiError):
+                await GenerationApi(client).submit("画猫")
+
+    asyncio.run(run())
+    assert attempts == 1
 
 
 def update(
@@ -72,7 +209,7 @@ class FakeGeneration:
         self.instructions.append(instruction)
         return f"job-{len(self.instructions)}"
 
-    async def history_result(self, _: str) -> GenerationResult | None:
+    async def result(self, _: str) -> GenerationResult | None:
         result = next(self.results)
         if isinstance(result, Exception):
             raise result
@@ -213,7 +350,7 @@ def test_two_workers_bound_concurrency_and_leave_third_job_waiting() -> None:
             self.active -= 1
             return f"job-{len(self.instructions)}"
 
-        async def history_result(self, _: str) -> GenerationResult:
+        async def result(self, _: str) -> GenerationResult:
             return GenerationResult("completed", b"WEBP", "image/webp")
 
     async def run() -> tuple[int, int]:
@@ -366,7 +503,7 @@ def test_missing_or_transient_history_uses_two_three_five_five_delays(
     generation = FakeGeneration(
         [
             None,
-            TransientUpstreamError("短暂失败"),
+            TransientGenerationApiError("短暂失败"),
             None,
             None,
             GenerationResult("completed", b"WEBP", "image/webp"),
@@ -382,6 +519,50 @@ def test_missing_or_transient_history_uses_two_three_five_five_delays(
     assert sleeps == [2.0, 3.0, 5.0, 5.0]
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (GenerationResult("failed"), "生成失败，请重试"),
+        (GenerationApiError("协议异常"), "生图服务暂时异常，请稍后重试"),
+    ],
+)
+def test_generation_failure_returns_stable_message(
+    result: GenerationResult | Exception, expected: str
+) -> None:
+    generation = FakeGeneration([result])
+
+    async def run() -> FakeApi:
+        api = FakeApi()
+        bot = TelegramBot(api, generation)
+        await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
+        await drain_queue(bot)
+        return api
+
+    api = asyncio.run(run())
+    assert [text for _, text in api.messages] == ["正在生成…", expected]
+    assert api.photos == []
+
+
+def test_submit_permanent_failure_returns_stable_message() -> None:
+    class FailedSubmit(FakeGeneration):
+        async def submit(self, instruction: str) -> str:
+            self.instructions.append(instruction)
+            raise GenerationApiError("提交失败")
+
+    async def run() -> FakeApi:
+        api = FakeApi()
+        bot = TelegramBot(api, FailedSubmit())
+        await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
+        await drain_queue(bot)
+        return api
+
+    api = asyncio.run(run())
+    assert [text for _, text in api.messages] == [
+        "正在生成…",
+        "生图服务暂时异常，请稍后重试",
+    ]
+
+
 def test_expired_job_times_out_and_worker_processes_next_job() -> None:
     class TimeoutGeneration(FakeGeneration):
         async def submit(self, instruction: str) -> str:
@@ -390,7 +571,7 @@ def test_expired_job_times_out_and_worker_processes_next_job() -> None:
                 await asyncio.Future()
             return "job-ok"
 
-        async def history_result(self, _: str) -> GenerationResult:
+        async def result(self, _: str) -> GenerationResult:
             return GenerationResult("completed", b"WEBP", "image/webp")
 
     async def run() -> tuple[FakeApi, TimeoutGeneration]:
@@ -417,7 +598,7 @@ def test_unexpected_worker_error_does_not_block_next_job() -> None:
                 raise RuntimeError("意外错误")
             return "job-ok"
 
-        async def history_result(self, _: str) -> GenerationResult:
+        async def result(self, _: str) -> GenerationResult:
             return GenerationResult("completed", b"WEBP", "image/webp")
 
     async def run() -> tuple[FakeApi, FlakyGeneration]:

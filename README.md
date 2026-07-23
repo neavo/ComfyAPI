@@ -30,12 +30,19 @@ uv sync
 
 ## 启动
 
+先启动 HTTP API，确认监听本机 `http://127.0.0.1:48188` 后，再启动 Telegram：
+
 ```powershell
 uv run uvicorn app.main:app --host 0.0.0.0 --port 48188
 uv run python -m app.telegram
 ```
 
 Windows 也可分别运行 `app_api.bat` 和 `app_tgbot.bat`。
+
+Telegram 使用 `tg_bot_token.txt` 连接 Bot API，并使用 `api_token.txt` 作为
+Bearer Token 调用本机 HTTP API；它不直连 ComfyUI 或 LLM。API 地址固定为
+`http://127.0.0.1:48188`。修改端口时须同步更新 `app_api.bat`、上述启动命令和
+`app/telegram.py` 中的 `GENERATION_API_URL`，无需新增配置文件。
 
 ## HTTP API
 
@@ -93,5 +100,7 @@ Invoke-RestMethod -Method Get -Uri "https://api.example.com/result/$($job.id)" `
 - `LLM upstream error`：检查 LLM 地址、密钥、模型和接口兼容性。
 - `ComfyUI upstream error`：检查 ComfyUI 地址、工作流及服务日志。
 - 机器人看不到群消息：确认已加入群组并关闭 Group Privacy Mode。
+- 机器人提示生图服务异常：确认本机 48188 端口的 API 已先启动，且
+  `api_token.txt` 与 API 使用的 Token 一致。
 
 测试：`uv run pytest`
