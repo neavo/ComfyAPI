@@ -120,7 +120,7 @@
   },
   "708": {
     "inputs": {
-      "unet_name": "anima\\anima_aesthetic_v1.1_rdbt_v12_simple_int8mixed_rowwise.safetensors",
+      "unet_name": "anima\\BSSANIRLANIMASemi_v20_rdbt_v12_simple_int8mixed_rowwise.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",

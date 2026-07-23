@@ -17,9 +17,9 @@ PROMPT_SUFFIX = """
 safe
 (mature:-1), (aged down:1)
 (simple background:-1.25)
-(shiny skin:-1.25), (flat color, anime coloring:1.25)
+(shiny skin:-1), flat color, anime coloring
 masterpiece, best quality, score_7
-rim light, light particles, cinematic lighting
+bloom, light particles, cinematic lighting
 depth of field, strong perspective, blurry background"""
 LOGGER = logging.getLogger(__name__)
 LLM_ATTEMPTS = 2
