@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from .service import (
     GenerationService,
+    InstructionError,
     LlmUpstreamError,
     UpstreamError,
     normalize_instruction,
@@ -59,6 +60,10 @@ async def new_job(
     generation: GenerationService = request.app.state.generation
     try:
         job_id = await generation.submit(body.instruction)
+    except InstructionError as error:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)
+        ) from error
     except LlmUpstreamError as error:
         LOGGER.error("指令预处理失败：%s", error)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, LLM_UPSTREAM_DETAIL) from error

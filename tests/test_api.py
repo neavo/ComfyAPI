@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from app.main import app
-from app.service import GenerationService, Settings, resolve_workflow
+from app.service import PROMPT_SUFFIX, GenerationService, Settings, resolve_workflow
 
 
 def workflow_data() -> dict[str, object]:
@@ -129,20 +129,47 @@ def test_new_accepts_instruction_and_returns_only_uuid() -> None:
     assert response.status_code == 202
     assert set(response.json()) == {"id"}
     UUID(response.json()["id"])
-    assert (
-        captured["prompt"]["10"]["inputs"]["text"]
-        == """a rainy neon street
-
-safe
-(mature:-1), (aged down:1)
-(simple background:-1.25)
-(shiny skin:-1.25), (flat color, anime coloring:1.25)
-masterpiece, best quality, score_7
-rim light, light particles, cinematic lighting
-depth of field, strong perspective, blurry background"""
+    assert captured["prompt"]["10"]["inputs"]["text"] == (
+        f"a rainy neon street\n{PROMPT_SUFFIX}"
     )
     assert captured["extra_data"] == {"extra_pnginfo": {"workflow": captured["prompt"]}}
     assert "生成雨夜街道" not in response.text
+
+
+def test_new_passthrough_skips_llm_removes_all_markers_and_keeps_suffix() -> None:
+    captured: dict[str, object] = {}
+
+    def upstream(req: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(req.content))
+        return response_json(200, {"prompt_id": captured["prompt_id"]})
+
+    response = request(
+        "POST",
+        "/new",
+        upstream,
+        body={
+            "instruction": "  保留  启用透传模式中间启用透传模式  空格  ",
+        },
+        llm_handler=unused_upstream,
+    )
+
+    assert response.status_code == 202
+    assert (
+        captured["prompt"]["10"]["inputs"]["text"]
+        == f"保留  中间  空格\n{PROMPT_SUFFIX}"
+    )
+
+
+def test_new_rejects_passthrough_without_remaining_instruction() -> None:
+    response = request(
+        "POST",
+        "/new",
+        unused_upstream,
+        body={"instruction": "  启用透传模式启用透传模式  "},
+        llm_handler=unused_upstream,
+    )
+
+    assert response.status_code == 422
 
 
 def test_new_does_not_submit_to_comfyui_when_llm_fails() -> None:

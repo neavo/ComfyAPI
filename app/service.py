@@ -13,6 +13,7 @@ import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "generation.json"
+PASSTHROUGH_MARKER = "启用透传模式"
 PROMPT_SUFFIX = """
 safe
 (mature:-1), (aged down:1)
@@ -84,15 +85,21 @@ class GenerationService:
     async def submit(self, instruction: str) -> str:
         instruction = normalize_instruction(instruction)
         job_id = str(uuid4())
-        try:
-            prompt = await preprocess_instruction(
-                self.llm_client,
-                self.settings,
-                self.system_prompt,
-                instruction,
+        if PASSTHROUGH_MARKER in instruction:
+            instruction = normalize_instruction(
+                instruction.replace(PASSTHROUGH_MARKER, "")
             )
-        except UpstreamError as error:
-            raise LlmUpstreamError(str(error)) from error
+            prompt = f"{instruction}\n{PROMPT_SUFFIX}"
+        else:
+            try:
+                prompt = await preprocess_instruction(
+                    self.llm_client,
+                    self.settings,
+                    self.system_prompt,
+                    instruction,
+                )
+            except UpstreamError as error:
+                raise LlmUpstreamError(str(error)) from error
         await submit_prompt(self.comfy_client, self.workflow, job_id, prompt)
         return job_id
 
