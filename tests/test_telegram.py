@@ -28,7 +28,10 @@ def test_generation_api_submit_sends_exact_authenticated_request() -> None:
         assert request.method == "POST"
         assert request.url.path == "/new"
         assert request.headers["authorization"] == "Bearer TOKEN"
-        assert request.read() == b'{"instruction":"\xe7\x94\xbb\xe4\xb8\x80\xe5\x8f\xaa\xe7\x8c\xab"}'
+        assert (
+            request.read()
+            == b'{"instruction":"\xe7\x94\xbb\xe4\xb8\x80\xe5\x8f\xaa\xe7\x8c\xab"}'
+        )
         return httpx.Response(202, json={"id": JOB_ID})
 
     async def run() -> str:
@@ -129,7 +132,9 @@ def test_generation_api_rejects_damaged_or_unknown_protocol(
         ) as client:
             api = GenerationApi(client)
             with pytest.raises(GenerationApiError):
-                await getattr(api, operation)("画猫" if operation == "submit" else JOB_ID)
+                await getattr(api, operation)(
+                    "画猫" if operation == "submit" else JOB_ID
+                )
 
     asyncio.run(run())
 
@@ -247,7 +252,6 @@ def test_only_leading_exact_bot_mention_becomes_instruction(
     [
         update("普通聊天"),
         update(is_bot=True),
-        update(chat_type="private"),
         update(text=None),
         {"update_id": 1, "edited_message": {}},
     ],
@@ -267,6 +271,62 @@ def test_irrelevant_updates_do_not_queue_send_or_generate(
     assert api.messages == []
     assert api.photos == []
     assert generation.instructions == []
+
+
+def test_private_text_generates_and_replies_with_photo() -> None:
+    async def run() -> tuple[FakeApi, FakeGeneration]:
+        api = FakeApi()
+        generation = FakeGeneration()
+        bot = TelegramBot(api, generation)
+        await bot.accept_update(
+            update("  画一只猫  ", chat_type="private", thread_id=None),
+            "PainterBot",
+        )
+        await drain_queue(bot)
+        return api, generation
+
+    api, generation = asyncio.run(run())
+    assert generation.instructions == ["画一只猫"]
+    assert [text for _, text in api.messages] == ["正在生成…"]
+    assert api.photos == [
+        (
+            {
+                "chat_id": "-1001",
+                "reply_parameters": '{"message_id": 7, "allow_sending_without_reply": true}',
+            },
+            b"WEBP",
+            "image/webp",
+        )
+    ]
+
+
+@pytest.mark.parametrize("text", ["/start", "/START@painterbot payload"])
+def test_private_start_explains_how_to_generate(text: str) -> None:
+    async def run() -> tuple[FakeApi, int]:
+        api = FakeApi()
+        bot = TelegramBot(api, FakeGeneration())
+        await bot.accept_update(
+            update(text, chat_type="private", thread_id=None), "PainterBot"
+        )
+        return api, bot.queue.qsize()
+
+    api, queued = asyncio.run(run())
+    assert queued == 0
+    assert [text for _, text in api.messages] == ["请直接发送生图描述"]
+
+
+def test_private_unknown_command_is_ignored() -> None:
+    async def run() -> tuple[FakeApi, int]:
+        api = FakeApi()
+        bot = TelegramBot(api, FakeGeneration())
+        await bot.accept_update(
+            update("/help", chat_type="private", thread_id=None), "PainterBot"
+        )
+        return api, bot.queue.qsize()
+
+    api, queued = asyncio.run(run())
+    assert queued == 0
+    assert api.messages == []
 
 
 def test_valid_message_enters_queue_with_deadline_starting_at_enqueue() -> None:
@@ -300,6 +360,29 @@ def test_empty_or_oversized_instruction_replies_without_queueing(
         api = FakeApi()
         bot = TelegramBot(api, FakeGeneration())
         await bot.accept_update(update(text), "PainterBot")
+        return api, bot.queue.qsize()
+
+    api, queued = asyncio.run(run())
+    assert queued == 0
+    assert [text for _, text in api.messages] == [reply]
+
+
+@pytest.mark.parametrize(
+    ("text", "reply"),
+    [
+        ("   ", "请输入生图描述"),
+        ("猫" * 4097, "生图描述长度必须为 1 至 4096 个字符"),
+    ],
+)
+def test_private_invalid_instruction_replies_without_queueing(
+    text: str, reply: str
+) -> None:
+    async def run() -> tuple[FakeApi, int]:
+        api = FakeApi()
+        bot = TelegramBot(api, FakeGeneration())
+        await bot.accept_update(
+            update(text, chat_type="private", thread_id=None), "PainterBot"
+        )
         return api, bot.queue.qsize()
 
     api, queued = asyncio.run(run())

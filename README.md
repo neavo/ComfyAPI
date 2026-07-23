@@ -85,13 +85,15 @@ Invoke-RestMethod -Method Get -Uri "https://api.example.com/result/$($job.id)" `
 
 ## Telegram
 
+私聊机器人时，直接发送生图描述；发送 `/start` 可查看使用提示。
+
 在 BotFather 中关闭 **Group Privacy Mode**，将机器人加入群组或超级群组，然后发送：
 
 ```text
 @机器人用户名 生图描述
 ```
 
-提及必须位于消息开头。任务繁忙或超时时请稍后重试；机器人重启后不会恢复尚未完成的群聊任务。
+群聊提及必须位于消息开头。任务繁忙或超时时请稍后重试；机器人重启后不会恢复尚未完成的任务。
 
 ## 排错
 

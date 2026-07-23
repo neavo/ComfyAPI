@@ -322,24 +322,41 @@ class TelegramBot:
         chat = message.get("chat")
         text = message.get("text")
         message_id = message.get("message_id")
+        chat_type = chat.get("type") if isinstance(chat, dict) else None
         if (
             not isinstance(sender, dict)
             or sender.get("is_bot") is True
             or not isinstance(chat, dict)
-            or chat.get("type") not in {"group", "supergroup"}
+            or chat_type not in {"private", "group", "supergroup"}
             or not isinstance(chat.get("id"), int)
             or not isinstance(message_id, int)
             or not isinstance(text, str)
         ):
             return
 
-        instruction = extract_instruction(text, username)
-        if instruction is None:
-            return
         thread_id = message.get("message_thread_id")
         reply = self.reply_data(chat["id"], message_id, thread_id)
+        if chat_type == "private":
+            instruction = text.strip()
+            if instruction:
+                command = instruction.split(maxsplit=1)[0].casefold()
+                if command in {"/start", f"/start@{username}".casefold()}:
+                    await self.api.send_message(reply, "请直接发送生图描述")
+                    return
+                if instruction.startswith("/"):
+                    return
+        else:
+            instruction = extract_instruction(text, username)
+            if instruction is None:
+                return
+
         if not instruction:
-            await self.api.send_message(reply, f"请在 @{username} 后输入生图描述")
+            prompt = (
+                "请输入生图描述"
+                if chat_type == "private"
+                else f"请在 @{username} 后输入生图描述"
+            )
+            await self.api.send_message(reply, prompt)
             return
         if len(instruction) > 4096:
             await self.api.send_message(reply, "生图描述长度必须为 1 至 4096 个字符")

@@ -129,18 +129,7 @@ def test_llm_preprocessing_uses_openai_chat_completions_format() -> None:
 
     result = asyncio.run(run())
 
-    assert (
-        result
-        == """a rainy neon street
-
-safe
-(mature:-1), (aged down:1)
-(simple background:-1.25)
-(shiny skin:-1.25), (flat color, anime coloring:1.25)
-masterpiece, best quality, score_7
-rim light, light particles, cinematic lighting
-depth of field, strong perspective, blurry background"""
-    )
+    assert result == f"a rainy neon street\n{service.PROMPT_SUFFIX}"
     assert captured == {
         "authorization": "Bearer llm-secret",
         "payload": {
