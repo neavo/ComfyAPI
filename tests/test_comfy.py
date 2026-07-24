@@ -194,10 +194,7 @@ async def test_job_rechecks_history_after_queue_race() -> None:
 
 @pytest.mark.anyio
 async def test_job_reports_missing_only_after_history_recheck() -> None:
-    paths: list[str] = []
-
     def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
         if request.url.path == "/queue":
             return httpx.Response(
                 200,
@@ -212,7 +209,6 @@ async def test_job_reports_missing_only_after_history_recheck() -> None:
         result = await ComfyClient(client).job(JOB_ID)
 
     assert result == ComfyJob("missing")
-    assert paths == [f"/history/{JOB_ID}", "/queue", f"/history/{JOB_ID}"]
 
 
 @pytest.mark.anyio

@@ -13,16 +13,16 @@
 uv sync
 ```
 
-在 `config` 目录创建以下单行 UTF-8 文本文件：
+创建 `config/config.toml`：
 
-| 文件 | 内容 |
-| --- | --- |
-| `api_token.txt` | API Bearer Token |
-| `comfy_url.txt` | ComfyUI 根地址，如 `http://127.0.0.1:8188` |
-| `llm_url.txt` | OpenAI 兼容的 Chat Completions 完整地址 |
-| `llm_api_key.txt` | 文生图指令扩写使用的 LLM API Key |
-| `llm_model.txt` | 文生图指令扩写使用的模型名 |
-| `tg_bot_token.txt` | Telegram Bot Token，仅机器人需要 |
+```toml
+api_token = "API Bearer Token"
+comfy_url = "http://127.0.0.1:8188"
+llm_url = "OpenAI 兼容的 Chat Completions 完整地址"
+llm_api_key = "文生图指令扩写使用的 LLM API Key"
+llm_model = "文生图指令扩写使用的模型名"
+tg_bot_token = "Telegram Bot Token，仅机器人需要"
+```
 
 同时确保 `prompt/system.md` 非空。
 
@@ -122,7 +122,7 @@ $caption = Invoke-RestMethod -Method Post `
   -InFile ".\input.webp"
 ```
 
-`/new` 和 `/result/{id}` 是 `0.2.x` 的文生图兼容别名，将在 `0.3.0` 删除。
+`/new` 和 `/result/{id}` 是 `0.2.x` 的文生图兼容别名，当前继续保留。
 
 ## Telegram
 

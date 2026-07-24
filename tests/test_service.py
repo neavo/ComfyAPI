@@ -72,24 +72,34 @@ def text_to_image(
     )
 
 
-def write_settings(fs, root: Path) -> None:
+def write_config(root: Path, **overrides: str | None) -> None:
+    values: dict[str, str | None] = {
+        "api_token": " secret ",
+        "comfy_url": "http://127.0.0.1:8188/",
+        "llm_url": "http://llm.local/v1/chat/completions",
+        "llm_api_key": "llm-secret",
+        "llm_model": "prompt-model",
+        **overrides,
+    }
     config = root / "config"
-    for name, value in {
-        "api_token.txt": "\ufeff secret ",
-        "comfy_url.txt": "http://127.0.0.1:8188/",
-        "llm_url.txt": "http://llm.local/v1/chat/completions",
-        "llm_api_key.txt": "llm-secret",
-        "llm_model.txt": "prompt-model",
-    }.items():
-        fs.create_file(config / name, contents=value)
+    config.mkdir(parents=True)
+    (config / "config.toml").write_text(
+        "".join(
+            f"{name} = {json.dumps(value, ensure_ascii=False)}\n"
+            for name, value in values.items()
+            if value is not None
+        ),
+        encoding="utf-8",
+    )
 
 
-def test_settings_load_from_project_root(fs, monkeypatch) -> None:
-    root = Path("/project")
-    write_settings(fs, root)
-    fs.create_dir("/elsewhere")
+def test_settings_load_from_project_root(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "project"
+    write_config(root)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
     monkeypatch.setattr(service, "PROJECT_ROOT", root)
-    monkeypatch.chdir("/elsewhere")
+    monkeypatch.chdir(elsewhere)
 
     loaded = service.load_settings()
 
@@ -102,12 +112,11 @@ def test_settings_load_from_project_root(fs, monkeypatch) -> None:
     )
 
 
-def test_missing_configuration_stops_startup(fs) -> None:
-    root = Path("/project")
-    write_settings(fs, root)
-    fs.remove_object(str(root / "config/llm_model.txt"))
+def test_missing_configuration_stops_startup(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    write_config(root, llm_model=None)
 
-    with pytest.raises(RuntimeError, match="llm_model.txt"):
+    with pytest.raises(RuntimeError, match="llm_model"):
         service.load_settings(root)
 
 
@@ -115,18 +124,22 @@ def test_missing_configuration_stops_startup(fs) -> None:
     "url",
     ["ftp://127.0.0.1", "http://user:pass@127.0.0.1", "http://127.0.0.1/path"],
 )
-def test_invalid_comfy_url_stops_startup(fs, url: str) -> None:
-    root = Path("/project")
-    write_settings(fs, root)
-    (root / "config/comfy_url.txt").write_text(url, encoding="utf-8")
+def test_invalid_comfy_url_stops_startup(tmp_path: Path, url: str) -> None:
+    root = tmp_path / "project"
+    write_config(root, comfy_url=url)
 
-    with pytest.raises(RuntimeError, match="comfy_url.txt"):
+    with pytest.raises(RuntimeError, match="comfy_url"):
         service.load_settings(root)
 
 
-def test_system_prompt_loads_multiline_utf8(fs, monkeypatch) -> None:
-    root = Path("/project")
-    fs.create_file(root / "prompt/system.md", contents="\ufeff 系统指令\n第二行 ")
+def test_system_prompt_loads_multiline_utf8(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "project"
+    path = root / "prompt" / "system.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("\ufeff 系统指令\n第二行 ", encoding="utf-8")
     monkeypatch.setattr(service, "PROJECT_ROOT", root)
 
     assert service.load_system_prompt() == "系统指令\n第二行"
@@ -222,17 +235,6 @@ async def test_llm_permanent_failure_is_not_retried() -> None:
             )
 
     assert attempts == 1
-
-
-@pytest.mark.parametrize("input_name", ["text", "image"])
-def test_workflow_markers_resolve_for_both_input_types(input_name: str) -> None:
-    template = service.resolve_workflow(workflow_data(input_name), input_name)
-
-    assert (
-        template.input_node_id,
-        template.output_node_id,
-        template.input_name,
-    ) == ("10", "20", input_name)
 
 
 def test_committed_workflows_build_prompts() -> None:

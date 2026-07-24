@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import random
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,6 @@ IMAGE_EXTENSIONS = {
     "image/png": "png",
     "image/webp": "webp",
 }
-IMAGE_MEDIA_TYPES = frozenset(IMAGE_EXTENSIONS)
 
 
 class LlmUpstreamError(RuntimeError):
@@ -172,30 +172,34 @@ def normalize_instruction(value: str) -> str:
     return value
 
 
-def read_required(path: Path) -> str:
+def load_config(root: Path | None = None) -> dict[str, object]:
+    root = PROJECT_ROOT if root is None else root
+    path = root / "config" / "config.toml"
     try:
-        value = path.read_text(encoding="utf-8-sig").strip()
-    except (OSError, UnicodeError) as error:
-        raise RuntimeError(f"无法读取配置文件 {path.name}: {error}") from error
-    if not value or "\n" in value or "\r" in value:
-        raise RuntimeError(f"配置文件 {path.name} 必须包含单行非空内容")
-    return value
+        with path.open("rb") as file:
+            return tomllib.load(file)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"无法加载配置文件 {path}: {error}") from error
+
+
+def required_setting(config: dict[str, object], name: str) -> str:
+    value = config.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"配置项 {name} 必须是非空字符串")
+    return value.strip()
 
 
 def load_settings(root: Path | None = None) -> Settings:
-    root = PROJECT_ROOT if root is None else root
-    config = root / "config"
-    token = read_required(config / "api_token.txt")
-    comfy_url = _http_url(
-        "comfy_url.txt", read_required(config / "comfy_url.txt"), True
-    )
-    llm_url = _http_url("llm_url.txt", read_required(config / "llm_url.txt"))
+    config = load_config(root)
+    token = required_setting(config, "api_token")
+    comfy_url = _http_url("comfy_url", required_setting(config, "comfy_url"), True)
+    llm_url = _http_url("llm_url", required_setting(config, "llm_url"))
     return Settings(
         token,
         comfy_url,
         llm_url,
-        read_required(config / "llm_api_key.txt"),
-        read_required(config / "llm_model.txt"),
+        required_setting(config, "llm_api_key"),
+        required_setting(config, "llm_model"),
     )
 
 

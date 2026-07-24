@@ -7,7 +7,12 @@ from typing import Any, TypeVar
 
 import httpx
 
-from .service import IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, PROJECT_ROOT, read_required
+from .service import (
+    IMAGE_EXTENSIONS,
+    MAX_IMAGE_BYTES,
+    load_config,
+    required_setting,
+)
 from .telegram_api import (
     RECONNECT_DELAY,
     BackendApi,
@@ -29,18 +34,14 @@ T = TypeVar("T")
 
 @dataclass(frozen=True, slots=True)
 class TextToImageJob:
-    chat_id: int
-    message_id: int
-    message_thread_id: int | None
+    reply: dict[str, str]
     instruction: str
     deadline: float
 
 
 @dataclass(frozen=True, slots=True)
 class ImageToTextJob:
-    chat_id: int
-    message_id: int
-    message_thread_id: int | None
+    reply: dict[str, str]
     file_id: str
     media_type: str
     deadline: float
@@ -98,7 +99,7 @@ def extract_image(message: dict[str, Any]) -> ImageAttachment | None:
     file_id = document.get("file_id")
     media_type = document.get("mime_type")
     size = document.get("file_size")
-    if not isinstance(file_id, str) or media_type not in IMAGE_MEDIA_TYPES:
+    if not isinstance(file_id, str) or media_type not in IMAGE_EXTENSIONS:
         return None
     return ImageAttachment(
         file_id,
@@ -210,9 +211,7 @@ class TelegramBot:
                 return
             await self._enqueue(
                 ImageToTextJob(
-                    chat["id"],
-                    message_id,
-                    thread_id if isinstance(thread_id, int) else None,
+                    reply,
                     attachment.file_id,
                     attachment.media_type,
                     asyncio.get_running_loop().time() + JOB_TIMEOUT,
@@ -254,9 +253,7 @@ class TelegramBot:
             return
         await self._enqueue(
             TextToImageJob(
-                chat["id"],
-                message_id,
-                thread_id if isinstance(thread_id, int) else None,
+                reply,
                 instruction,
                 asyncio.get_running_loop().time() + JOB_TIMEOUT,
             ),
@@ -281,22 +278,17 @@ class TelegramBot:
                     async with asyncio.timeout_at(job.deadline):
                         await self._process(job)
                 except TimeoutError:
-                    reply = self.reply_data(
-                        job.chat_id, job.message_id, job.message_thread_id
-                    )
-                    await self.api.send_message(reply, "任务超时，请稍后重试")
+                    await self.api.send_message(job.reply, "任务超时，请稍后重试")
                     LOGGER.error(
-                        "Telegram 任务超时：worker=%s chat_id=%s message_id=%s",
+                        "Telegram 任务超时：worker=%s reply=%s",
                         worker_id,
-                        job.chat_id,
-                        job.message_id,
+                        job.reply,
                     )
                 except Exception:
                     LOGGER.exception(
-                        "Telegram Worker 未预期失败：worker=%s chat_id=%s message_id=%s",
+                        "Telegram Worker 未预期失败：worker=%s reply=%s",
                         worker_id,
-                        job.chat_id,
-                        job.message_id,
+                        job.reply,
                     )
             finally:
                 self.queue.task_done()
@@ -308,8 +300,8 @@ class TelegramBot:
             await self._process_image_to_text(job)
 
     async def _process_text_to_image(self, job: TextToImageJob) -> None:
-        reply = self.reply_data(job.chat_id, job.message_id, job.message_thread_id)
-        await self._send_progress(reply, "正在生成…", job)
+        reply = job.reply
+        await self.api.send_message(reply, "正在生成…")
         job_id: str | None = None
         try:
             job_id = await self.backend.submit_text_to_image(job.instruction)
@@ -321,10 +313,8 @@ class TelegramBot:
             )
         except BackendApiError as error:
             LOGGER.error(
-                "Telegram 文生图 API 任务失败：chat_id=%s message_id=%s "
-                "job_id=%s error=%s",
-                job.chat_id,
-                job.message_id,
+                "Telegram 文生图 API 任务失败：reply=%s job_id=%s error=%s",
+                job.reply,
                 job_id,
                 error,
             )
@@ -346,23 +336,21 @@ class TelegramBot:
         )
         log = LOGGER.info if delivered else LOGGER.error
         log(
-            "Telegram 文生图任务%s：chat_id=%s message_id=%s job_id=%s",
+            "Telegram 文生图任务%s：reply=%s job_id=%s",
             "完成" if delivered else "图片交付失败",
-            job.chat_id,
-            job.message_id,
+            job.reply,
             job_id,
         )
 
     async def _process_image_to_text(self, job: ImageToTextJob) -> None:
-        reply = self.reply_data(job.chat_id, job.message_id, job.message_thread_id)
-        await self._send_progress(reply, "正在反推提示词…", job)
+        reply = job.reply
+        await self.api.send_message(reply, "正在反推提示词…")
         try:
             image = await self.api.download_file(job.file_id)
         except TelegramError as error:
             LOGGER.error(
-                "Telegram 图片下载失败：chat_id=%s message_id=%s error=%s",
-                job.chat_id,
-                job.message_id,
+                "Telegram 图片下载失败：reply=%s error=%s",
+                job.reply,
                 error,
             )
             await self.api.send_message(reply, "图片下载失败，请重试")
@@ -379,10 +367,8 @@ class TelegramBot:
             )
         except BackendApiError as error:
             LOGGER.error(
-                "Telegram 图生文 API 任务失败：chat_id=%s message_id=%s "
-                "job_id=%s error=%s",
-                job.chat_id,
-                job.message_id,
+                "Telegram 图生文 API 任务失败：reply=%s job_id=%s error=%s",
+                job.reply,
                 job_id,
                 error,
             )
@@ -402,10 +388,9 @@ class TelegramBot:
             delivered = await self.api.send_message(reply, chunk) and delivered
         log = LOGGER.info if delivered else LOGGER.error
         log(
-            "Telegram 图生文任务%s：chat_id=%s message_id=%s job_id=%s",
+            "Telegram 图生文任务%s：reply=%s job_id=%s",
             "完成" if delivered else "文本交付失败",
-            job.chat_id,
-            job.message_id,
+            job.reply,
             job_id,
         )
 
@@ -423,35 +408,20 @@ class TelegramBot:
             except TransientBackendApiError as error:
                 result = None
                 LOGGER.warning(
-                    "%s API 查询瞬时失败：chat_id=%s message_id=%s job_id=%s error=%s",
+                    "%s API 查询瞬时失败：reply=%s job_id=%s error=%s",
                     operation,
-                    job.chat_id,
-                    job.message_id,
+                    job.reply,
                     job_id,
                     error,
                 )
             if result is not None:
                 return result
             LOGGER.info(
-                "%s API 尚无结果：chat_id=%s message_id=%s job_id=%s，%.1f 秒后重试",
+                "%s API 尚无结果：reply=%s job_id=%s，%.1f 秒后重试",
                 operation,
-                job.chat_id,
-                job.message_id,
+                job.reply,
                 job_id,
                 RESULT_POLL_DELAY,
-            )
-
-    async def _send_progress(
-        self,
-        reply: dict[str, str],
-        text: str,
-        job: TextToImageJob | ImageToTextJob,
-    ) -> None:
-        if not await self.api.send_message(reply, text):
-            LOGGER.error(
-                "Telegram 状态消息交付失败，继续任务：chat_id=%s message_id=%s",
-                job.chat_id,
-                job.message_id,
             )
 
     @staticmethod
@@ -470,9 +440,9 @@ class TelegramBot:
 
 
 async def main() -> None:
-    config = PROJECT_ROOT / "config"
-    telegram_token = read_required(config / "tg_bot_token.txt")
-    api_token = read_required(config / "api_token.txt")
+    config = load_config()
+    telegram_token = required_setting(config, "tg_bot_token")
+    api_token = required_setting(config, "api_token")
     async with (
         httpx.AsyncClient(
             base_url=API_URL,

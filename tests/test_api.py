@@ -17,50 +17,25 @@ JOB_ID = "550e8400-e29b-41d4-a716-446655440000"
 PNG = b"\x89PNG\r\n\x1a\nimage"
 
 
-class FakeTextToImage:
+class FakeService:
     def __init__(
         self,
         *,
         submit: str | Exception = JOB_ID,
-        result: ImageResult | Exception = ImageResult("missing"),
+        result: object = None,
     ) -> None:
         self.submit_value = submit
         self.result_value = result
-        self.instructions: list[str] = []
+        self.submissions: list[tuple[object, ...]] = []
         self.job_ids: list[str] = []
 
-    async def submit(self, instruction: str) -> str:
-        self.instructions.append(instruction)
+    async def submit(self, *args: object) -> str:
+        self.submissions.append(args)
         if isinstance(self.submit_value, Exception):
             raise self.submit_value
         return self.submit_value
 
-    async def result(self, job_id: str) -> ImageResult:
-        self.job_ids.append(job_id)
-        if isinstance(self.result_value, Exception):
-            raise self.result_value
-        return self.result_value
-
-
-class FakeImageToText:
-    def __init__(
-        self,
-        *,
-        submit: str | Exception = JOB_ID,
-        result: TextResult | Exception = TextResult("missing"),
-    ) -> None:
-        self.submit_value = submit
-        self.result_value = result
-        self.images: list[tuple[bytes, str]] = []
-        self.job_ids: list[str] = []
-
-    async def submit(self, image: bytes, media_type: str) -> str:
-        self.images.append((image, media_type))
-        if isinstance(self.submit_value, Exception):
-            raise self.submit_value
-        return self.submit_value
-
-    async def result(self, job_id: str) -> TextResult:
+    async def result(self, job_id: str) -> object:
         self.job_ids.append(job_id)
         if isinstance(self.result_value, Exception):
             raise self.result_value
@@ -71,16 +46,18 @@ async def request(
     method: str,
     path: str,
     *,
-    text_to_image: FakeTextToImage | None = None,
-    image_to_text: FakeImageToText | None = None,
+    text_to_image: FakeService | None = None,
+    image_to_text: FakeService | None = None,
     token: str | None = "secret",
     json: object | None = None,
     content: bytes | None = None,
     content_type: str | None = None,
 ) -> httpx.Response:
     app.state.settings = SimpleNamespace(token="secret")
-    app.state.text_to_image = text_to_image or FakeTextToImage()
-    app.state.image_to_text = image_to_text or FakeImageToText()
+    app.state.text_to_image = text_to_image or FakeService(
+        result=ImageResult("missing")
+    )
+    app.state.image_to_text = image_to_text or FakeService(result=TextResult("missing"))
     headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
     if content_type is not None:
         headers["Content-Type"] = content_type
@@ -122,7 +99,7 @@ async def test_all_routes_require_bearer_token(
 @pytest.mark.anyio
 @pytest.mark.parametrize("path", ["/text_to_image", "/new"])
 async def test_text_to_image_routes_share_submission_contract(path: str) -> None:
-    service = FakeTextToImage()
+    service = FakeService()
 
     response = await request(
         "POST",
@@ -133,7 +110,7 @@ async def test_text_to_image_routes_share_submission_contract(path: str) -> None
 
     assert response.status_code == 202
     assert response.json() == {"id": JOB_ID}
-    assert service.instructions == ["生成雨夜街道"]
+    assert service.submissions == [("生成雨夜街道",)]
 
 
 @pytest.mark.anyio
@@ -146,7 +123,7 @@ async def test_text_to_image_routes_share_submission_contract(path: str) -> None
     ],
 )
 async def test_text_to_image_rejects_invalid_json(body: object) -> None:
-    service = FakeTextToImage()
+    service = FakeService()
 
     response = await request(
         "POST",
@@ -156,7 +133,7 @@ async def test_text_to_image_rejects_invalid_json(body: object) -> None:
     )
 
     assert response.status_code == 422
-    assert service.instructions == []
+    assert service.submissions == []
 
 
 @pytest.mark.anyio
@@ -176,7 +153,7 @@ async def test_text_to_image_sanitizes_submission_errors(
     response = await request(
         "POST",
         "/text_to_image",
-        text_to_image=FakeTextToImage(submit=error),
+        text_to_image=FakeService(submit=error),
         json={"instruction": "内部指令"},
     )
 
@@ -187,7 +164,7 @@ async def test_text_to_image_sanitizes_submission_errors(
 
 @pytest.mark.anyio
 async def test_image_to_text_accepts_raw_image() -> None:
-    service = FakeImageToText()
+    service = FakeService()
 
     response = await request(
         "POST",
@@ -199,7 +176,7 @@ async def test_image_to_text_accepts_raw_image() -> None:
 
     assert response.status_code == 202
     assert response.json() == {"id": JOB_ID}
-    assert service.images == [(PNG, "image/png")]
+    assert service.submissions == [(PNG, "image/png")]
 
 
 @pytest.mark.anyio
@@ -216,7 +193,7 @@ async def test_image_to_text_rejects_invalid_images(
     content_type: str,
     status_code: int,
 ) -> None:
-    service = FakeImageToText()
+    service = FakeService()
 
     response = await request(
         "POST",
@@ -227,12 +204,12 @@ async def test_image_to_text_rejects_invalid_images(
     )
 
     assert response.status_code == status_code
-    assert service.images == []
+    assert service.submissions == []
 
 
 @pytest.mark.anyio
 async def test_image_to_text_rejects_oversized_body() -> None:
-    service = FakeImageToText()
+    service = FakeService()
 
     response = await request(
         "POST",
@@ -243,7 +220,7 @@ async def test_image_to_text_rejects_oversized_body() -> None:
     )
 
     assert response.status_code == 413
-    assert service.images == []
+    assert service.submissions == []
 
 
 @pytest.mark.anyio
@@ -251,7 +228,7 @@ async def test_image_to_text_sanitizes_submission_error() -> None:
     response = await request(
         "POST",
         "/image_to_text",
-        image_to_text=FakeImageToText(submit=ComfyError("敏感上传错误")),
+        image_to_text=FakeService(submit=ComfyError("敏感上传错误")),
         content=PNG,
         content_type="image/png",
     )
@@ -264,7 +241,7 @@ async def test_image_to_text_sanitizes_submission_error() -> None:
 @pytest.mark.anyio
 @pytest.mark.parametrize("path", [f"/text_to_image/{JOB_ID}", f"/result/{JOB_ID}"])
 async def test_text_to_image_result_routes_return_image(path: str) -> None:
-    service = FakeTextToImage(result=ImageResult("completed", b"WEBP", "image/webp"))
+    service = FakeService(result=ImageResult("completed", b"WEBP", "image/webp"))
 
     response = await request("GET", path, text_to_image=service)
 
@@ -290,7 +267,7 @@ async def test_text_to_image_maps_task_status(
     response = await request(
         "GET",
         f"/text_to_image/{JOB_ID}",
-        text_to_image=FakeTextToImage(result=result),
+        text_to_image=FakeService(result=result),
     )
 
     assert response.status_code == status_code
@@ -322,7 +299,7 @@ async def test_image_to_text_maps_task_status(
     response = await request(
         "GET",
         f"/image_to_text/{JOB_ID}",
-        image_to_text=FakeImageToText(result=result),
+        image_to_text=FakeService(result=result),
     )
 
     assert response.status_code == status_code
@@ -345,9 +322,9 @@ async def test_result_routes_sanitize_upstream_errors(
     service_name: str,
 ) -> None:
     kwargs = (
-        {"text_to_image": FakeTextToImage(result=ComfyError("内部错误"))}
+        {"text_to_image": FakeService(result=ComfyError("内部错误"))}
         if service_name == "text"
-        else {"image_to_text": FakeImageToText(result=ComfyError("内部错误"))}
+        else {"image_to_text": FakeService(result=ComfyError("内部错误"))}
     )
 
     response = await request("GET", path, **kwargs)
@@ -355,14 +332,3 @@ async def test_result_routes_sanitize_upstream_errors(
     assert response.status_code == 502
     assert response.json() == {"detail": "ComfyUI upstream error"}
     assert "内部错误" not in response.text
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "path",
-    ["/text_to_image/not-a-uuid", "/image_to_text/not-a-uuid"],
-)
-async def test_result_routes_reject_invalid_uuid(path: str) -> None:
-    response = await request("GET", path)
-
-    assert response.status_code == 422

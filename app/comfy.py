@@ -103,8 +103,6 @@ class ComfyClient:
     async def download_image(self, image: object) -> DownloadedImage:
         if not isinstance(image, dict):
             raise ComfyError("图片元数据结构损坏")
-        if image.get("type") != "output":
-            raise ComfyError("图片不是 output 文件")
         if not all(
             isinstance(image.get(field), str) for field in ("filename", "subfolder")
         ):

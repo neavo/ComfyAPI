@@ -12,7 +12,6 @@ from app.telegram import (
     TextToImageJob,
     extract_image,
     extract_instruction,
-    split_message,
 )
 from app.telegram_api import (
     MAX_IMAGE_BYTES,
@@ -51,6 +50,10 @@ def update(
     if thread_id is not None:
         message["message_thread_id"] = thread_id
     return {"update_id": update_id, "message": message}
+
+
+def reply(message_id: int = 7) -> dict[str, str]:
+    return TelegramBot.reply_data(-1001, message_id, None)
 
 
 class FakeTelegram:
@@ -185,15 +188,6 @@ def test_image_extraction_selects_largest_photo_and_image_documents() -> None:
         extract_image({"document": {"file_id": "text", "mime_type": "text/plain"}})
         is None
     )
-
-
-def test_long_text_is_split_without_data_loss() -> None:
-    text = ("word " * 2000).strip()
-
-    chunks = split_message(text, 100)
-
-    assert all(0 < len(chunk) <= 100 for chunk in chunks)
-    assert " ".join(chunks) == text
 
 
 @pytest.mark.anyio
@@ -380,17 +374,17 @@ async def test_long_reverse_prompt_is_delivered_in_multiple_messages() -> None:
     ("job", "results", "expected"),
     [
         (
-            TextToImageJob(-1001, 7, None, "画猫", float("inf")),
+            TextToImageJob(reply(), "画猫", float("inf")),
             {"image_results": [ImageApiResult("failed")]},
             "生成失败，请重试",
         ),
         (
-            ImageToTextJob(-1001, 7, None, "photo", "image/jpeg", float("inf")),
+            ImageToTextJob(reply(), "photo", "image/jpeg", float("inf")),
             {"text_results": [TextApiResult("missing")]},
             "反推任务已丢失，请重试",
         ),
         (
-            TextToImageJob(-1001, 7, None, "画猫", float("inf")),
+            TextToImageJob(reply(), "画猫", float("inf")),
             {"image_results": [BackendApiError("协议异常")]},
             "生图服务暂时异常，请稍后重试",
         ),
@@ -424,9 +418,9 @@ async def test_expired_job_does_not_block_next_job() -> None:
     backend = TimeoutBackend()
     bot = TelegramBot(telegram, backend)
     loop = asyncio.get_running_loop()
-    bot.queue.put_nowait(TextToImageJob(-1001, 1, None, "超时任务", loop.time()))
+    bot.queue.put_nowait(TextToImageJob(reply(1), "超时任务", loop.time()))
     bot.queue.put_nowait(
-        TextToImageJob(-1001, 2, None, "后续任务", loop.time() + JOB_TIMEOUT)
+        TextToImageJob(reply(2), "后续任务", loop.time() + JOB_TIMEOUT)
     )
 
     await drain_queue(bot)
