@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 import httpx
@@ -40,7 +41,7 @@ class ComfyClient:
                 "/upload/image",
                 data={
                     "type": "input",
-                    "subfolder": "api/image_to_text",
+                    "subfolder": f"api/{datetime.now():%Y%m%d}",
                     "overwrite": "false",
                 },
                 files={"image": (filename, image, media_type)},

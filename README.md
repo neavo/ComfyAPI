@@ -136,7 +136,8 @@ $caption = Invoke-RestMethod -Method Post `
 
 ## 运维与排错
 
-- 图生文上传文件保存在 ComfyUI `input/api/image_to_text`，部署侧应按保留期清理。
+- 文生图输出和图生文上传分别按日期保存在 ComfyUI `output/api/YYYYMMDD` 与
+  `input/api/YYYYMMDD`，部署侧应按保留期清理。
 - 工作流错误：确认以 API Format 导出，并检查 `api_input`、`api_output`。
 - 图生文缺少文本：确认 `api_output` 在 `/history/{prompt_id}` 中产生非空 `text`。
 - `LLM upstream error`：检查文生图扩写模型地址、密钥和模型名。

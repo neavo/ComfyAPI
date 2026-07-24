@@ -242,6 +242,10 @@ def test_committed_workflows_build_prompts() -> None:
     image = service.load_workflow(service.IMAGE_TO_TEXT_WORKFLOW_PATH, "image")
 
     assert (
+        text.data[text.output_node_id]["inputs"]["filename_prefix"]
+        == "api/%date:yyyyMMdd%/%date:yyyyMMdd%"
+    )
+    assert (
         service.build_workflow(text, "生成雨夜")[text.input_node_id]["inputs"]["text"]
         == "生成雨夜"
     )

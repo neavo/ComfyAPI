@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+from app import comfy
 from app.comfy import ComfyClient, ComfyError, ComfyJob, DownloadedImage
 
 
@@ -20,8 +21,16 @@ def successful_history(outputs: object) -> dict[str, object]:
 
 
 @pytest.mark.anyio
-async def test_upload_image_returns_workflow_path() -> None:
+async def test_upload_image_returns_date_partitioned_workflow_path(monkeypatch) -> None:
     captured: dict[str, object] = {}
+    actual_datetime = comfy.datetime
+
+    class FixedDatetime:
+        @staticmethod
+        def now():
+            return actual_datetime(2012, 12, 12)
+
+    monkeypatch.setattr(comfy, "datetime", FixedDatetime)
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["content_type"] = request.headers["content-type"]
@@ -30,7 +39,7 @@ async def test_upload_image_returns_workflow_path() -> None:
             200,
             json={
                 "name": "job.webp",
-                "subfolder": "api\\image_to_text",
+                "subfolder": "api\\20121212",
                 "type": "input",
             },
         )
@@ -45,7 +54,7 @@ async def test_upload_image_returns_workflow_path() -> None:
             "image/webp",
         )
 
-    assert path == "api/image_to_text/job.webp"
+    assert path == "api/20121212/job.webp"
     assert str(captured["content_type"]).startswith("multipart/form-data;")
     body = bytes(captured["body"])
     assert all(
@@ -54,7 +63,7 @@ async def test_upload_image_returns_workflow_path() -> None:
             b'name="type"',
             b"input",
             b'name="subfolder"',
-            b"api/image_to_text",
+            b"api/20121212",
             b'filename="job.webp"',
             b"WEBP",
         )

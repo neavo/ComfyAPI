@@ -17,7 +17,7 @@
   },
   "169": {
     "inputs": {
-      "filename_prefix": "api/%date:yyyyMMdd%",
+      "filename_prefix": "api/%date:yyyyMMdd%/%date:yyyyMMdd%",
       "file_format": "webp",
       "lossless_webp": false,
       "quality": 95,
