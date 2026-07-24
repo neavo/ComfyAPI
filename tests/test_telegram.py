@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from app.telegram import (
+    HELP_TEXT,
     JOB_TIMEOUT,
     QUEUE_CAPACITY,
     ImageToTextJob,
@@ -21,18 +22,6 @@ from app.telegram_api import (
     TextApiResult,
     TransientBackendApiError,
 )
-
-EXPECTED_HELP = """🤖 使用帮助
-
-🎨 生图
-发送文字描述；群聊格式：@机器人 生图描述
-
-🔍 反推提示词
-发送照片或 JPEG、PNG、WebP 图片文件；群聊请在图片说明中 @机器人
-
-⚡ 透传提示词
-格式：启用透传模式 <提示词>
-作用：跳过自动扩写"""
 
 
 def update(
@@ -364,7 +353,7 @@ async def test_private_help_explains_all_features(text: str) -> None:
     )
 
     assert bot.queue.empty()
-    assert [text for _, text in telegram.messages] == [EXPECTED_HELP]
+    assert [text for _, text in telegram.messages] == [HELP_TEXT]
 
 
 @pytest.mark.anyio
@@ -389,7 +378,18 @@ async def test_group_bare_mention_shows_help() -> None:
     await bot.accept_update(update("@PainterBot"), "PainterBot")
 
     assert bot.queue.empty()
-    assert [text for _, text in telegram.messages] == [EXPECTED_HELP]
+    assert [text for _, text in telegram.messages] == [HELP_TEXT]
+
+
+@pytest.mark.anyio
+async def test_group_help_command_for_bot_shows_help() -> None:
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend())
+
+    await bot.accept_update(update("/help@neavo_comfy_bot"), "neavo_comfy_bot")
+
+    assert bot.queue.empty()
+    assert [text for _, text in telegram.messages] == [HELP_TEXT]
 
 
 @pytest.mark.anyio
