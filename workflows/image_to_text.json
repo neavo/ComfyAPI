@@ -22,10 +22,10 @@
   "3": {
     "inputs": {
       "text_input": "",
-      "task": "prompt_gen_mixed_caption",
+      "task": "prompt_gen_mixed_caption_plus",
       "fill_mask": false,
       "keep_model_loaded": false,
-      "max_new_tokens": 768,
+      "max_new_tokens": 512,
       "num_beams": 3,
       "do_sample": true,
       "output_mask_select": "",

@@ -14,7 +14,7 @@ import httpx
 from .comfy import ComfyClient, ComfyError, JobStatus
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TEXT_TO_IMAGE_WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "generation.json"
+TEXT_TO_IMAGE_WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "text_to_image.json"
 IMAGE_TO_TEXT_WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "image_to_text.json"
 SAFETY_PROMPT_PATH = PROJECT_ROOT / "prompt" / "safety.md"
 INPUT_MARKER = "api_input"
@@ -149,7 +149,7 @@ class ImageToTextService:
         uploaded = await self.comfy.upload_image(filename, image, media_type)
         await self.comfy.submit(
             job_id,
-            build_workflow(self.workflow, uploaded),
+            build_workflow(self.workflow, uploaded, randomize_seeds=True),
         )
         return job_id
 

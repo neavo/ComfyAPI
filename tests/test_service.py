@@ -397,7 +397,8 @@ async def test_text_to_image_returns_downloaded_output() -> None:
 
 
 @pytest.mark.anyio
-async def test_image_to_text_uploads_and_returns_raw_text() -> None:
+async def test_image_to_text_uploads_and_returns_raw_text(monkeypatch) -> None:
+    monkeypatch.setattr(service.random, "randint", lambda *_: 99)
     comfy = FakeComfy(
         ComfyJob("completed", {"20": {"text": ["  description\n\ntags  "]}})
     )
@@ -413,6 +414,8 @@ async def test_image_to_text_uploads_and_returns_raw_text() -> None:
     assert comfy.submissions[0][1]["10"]["inputs"]["image"] == (
         f"api/image_to_text/{job_id}.png"
     )
+    assert comfy.submissions[0][1]["10"]["inputs"]["seed"] == 99
+    assert comfy.submissions[0][1]["20"]["inputs"]["noise_seed"] == 99
     assert result == service.TextResult("completed", "description\n\ntags")
 
 

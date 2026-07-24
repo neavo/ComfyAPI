@@ -33,7 +33,7 @@ tg_safe_mode_exempt_chat_ids = [...]
 
 | 文件 | 用途 | `api_input` 输入 |
 | --- | --- | --- |
-| `workflows/generation.json` | 文生图 | `inputs.text` |
+| `workflows/text_to_image.json` | 文生图 | `inputs.text` |
 | `workflows/image_to_text.json` | Florence-2 图生文 | `inputs.image` |
 
 两个工作流都必须以 **API Format** 导出，并恰好包含标题为 `api_input` 和
