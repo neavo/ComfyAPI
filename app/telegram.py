@@ -37,6 +37,7 @@ class TextToImageJob:
     reply: dict[str, str]
     instruction: str
     deadline: float
+    safe_mode: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,10 +125,28 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
+def load_safe_mode_exempt_chat_ids(
+    config: dict[str, object],
+) -> frozenset[int]:
+    name = "tg_safe_mode_exempt_chat_ids"
+    value = config.get(name, [])
+    if not isinstance(value, list) or any(
+        not isinstance(chat_id, int) or isinstance(chat_id, bool) for chat_id in value
+    ):
+        raise RuntimeError(f"配置项 {name} 必须是整数数组")
+    return frozenset(value)
+
+
 class TelegramBot:
-    def __init__(self, api: TelegramApi, backend: BackendApi) -> None:
+    def __init__(
+        self,
+        api: TelegramApi,
+        backend: BackendApi,
+        safe_mode_exempt_chat_ids: frozenset[int] = frozenset(),
+    ) -> None:
         self.api = api
         self.backend = backend
+        self.safe_mode_exempt_chat_ids = safe_mode_exempt_chat_ids
         self.queue: asyncio.Queue[TextToImageJob | ImageToTextJob] = asyncio.Queue(
             QUEUE_CAPACITY
         )
@@ -256,6 +275,8 @@ class TelegramBot:
                 reply,
                 instruction,
                 asyncio.get_running_loop().time() + JOB_TIMEOUT,
+                chat_type == "private"
+                or chat["id"] not in self.safe_mode_exempt_chat_ids,
             ),
             reply,
         )
@@ -301,10 +322,13 @@ class TelegramBot:
 
     async def _process_text_to_image(self, job: TextToImageJob) -> None:
         reply = job.reply
-        await self.api.send_message(reply, "正在生成…")
+        await self.api.send_message(reply, "正在生成图片，请稍后 …")
         job_id: str | None = None
         try:
-            job_id = await self.backend.submit_text_to_image(job.instruction)
+            job_id = await self.backend.submit_text_to_image(
+                job.instruction,
+                job.safe_mode,
+            )
             result = await self._poll(
                 job_id,
                 self.backend.text_to_image_result,
@@ -344,7 +368,7 @@ class TelegramBot:
 
     async def _process_image_to_text(self, job: ImageToTextJob) -> None:
         reply = job.reply
-        await self.api.send_message(reply, "正在反推提示词…")
+        await self.api.send_message(reply, "正在反推提示词，请稍后 …")
         try:
             image = await self.api.download_file(job.file_id)
         except TelegramError as error:
@@ -443,6 +467,7 @@ async def main() -> None:
     config = load_config()
     telegram_token = required_setting(config, "tg_bot_token")
     api_token = required_setting(config, "api_token")
+    safe_mode_exempt_chat_ids = load_safe_mode_exempt_chat_ids(config)
     async with (
         httpx.AsyncClient(
             base_url=API_URL,
@@ -457,9 +482,11 @@ async def main() -> None:
         await TelegramBot(
             TelegramApi(telegram_token, telegram_client),
             BackendApi(backend_client),
+            safe_mode_exempt_chat_ids,
         ).run()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(main())

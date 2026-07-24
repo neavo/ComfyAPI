@@ -27,12 +27,15 @@ async def test_backend_api_submits_both_task_types() -> None:
         transport=httpx.MockTransport(handler),
     ) as client:
         backend = BackendApi(client)
-        text_id = await backend.submit_text_to_image("画一只猫")
+        text_id = await backend.submit_text_to_image("画一只猫", False)
         image_id = await backend.submit_image_to_text(b"PNG", "image/png")
 
     assert (text_id, image_id) == (JOB_ID, JOB_ID)
     assert requests[0].url.path == "/text_to_image"
-    assert json.loads(requests[0].content) == {"instruction": "画一只猫"}
+    assert json.loads(requests[0].content) == {
+        "instruction": "画一只猫",
+        "safe_mode": False,
+    }
     assert requests[1].url.path == "/image_to_text"
     assert requests[1].headers["content-type"] == "image/png"
     assert requests[1].content == b"PNG"

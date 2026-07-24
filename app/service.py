@@ -16,12 +16,12 @@ from .comfy import ComfyClient, ComfyError, JobStatus
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEXT_TO_IMAGE_WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "generation.json"
 IMAGE_TO_TEXT_WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "image_to_text.json"
+SAFETY_PROMPT_PATH = PROJECT_ROOT / "prompt" / "safety.md"
 INPUT_MARKER = "api_input"
 OUTPUT_MARKER = "api_output"
 PASSTHROUGH_MARKER = "启用透传模式"
-PROMPT_SUFFIX = """
-safe
-(mature:-1), aged down
+SAFE_TAG = "safe"
+PROMPT_SUFFIX = """(mature:-1), aged down
 (simple background:-1.25)
 (shiny skin:-1), flat color, anime coloring
 masterpiece, best quality, score_7
@@ -84,28 +84,32 @@ class TextToImageService:
         llm_client: httpx.AsyncClient,
         settings: Settings,
         system_prompt: str,
+        safety_prompt: str,
         workflow: WorkflowTemplate,
     ) -> None:
         self.comfy = comfy
         self.llm_client = llm_client
         self.settings = settings
         self.system_prompt = system_prompt
+        self.safety_prompt = safety_prompt
         self.workflow = workflow
 
-    async def submit(self, instruction: str) -> str:
+    async def submit(self, instruction: str, *, safe_mode: bool = True) -> str:
         job_id = str(uuid4())
         if PASSTHROUGH_MARKER in instruction:
-            instruction = normalize_instruction(
-                instruction.replace(PASSTHROUGH_MARKER, "")
-            )
-            prompt = f"{instruction}\n{PROMPT_SUFFIX}"
+            prompt = normalize_instruction(instruction.replace(PASSTHROUGH_MARKER, ""))
         else:
             prompt = await preprocess_instruction(
                 self.llm_client,
                 self.settings,
-                self.system_prompt,
+                (
+                    f"{self.system_prompt}\n\n{self.safety_prompt}"
+                    if safe_mode
+                    else self.system_prompt
+                ),
                 instruction,
             )
+        prompt = finalize_prompt(prompt, safe_mode)
         await self.comfy.submit(
             job_id,
             build_workflow(self.workflow, prompt, randomize_seeds=True),
@@ -170,6 +174,11 @@ def normalize_instruction(value: str) -> str:
     if not 1 <= len(value) <= 4096:
         raise InstructionError("instruction 长度必须为 1 至 4096 个字符")
     return value
+
+
+def finalize_prompt(prompt: str, safe_mode: bool) -> str:
+    safe_tag = f"{SAFE_TAG}\n" if safe_mode else ""
+    return f"{prompt}\n{safe_tag}{PROMPT_SUFFIX}"
 
 
 def load_config(root: Path | None = None) -> dict[str, object]:
@@ -331,7 +340,7 @@ async def preprocess_instruction(
                     raise LlmUpstreamError(
                         "LLM 响应缺少非空 choices[0].message.content"
                     )
-                return f"{content.strip()}\n{PROMPT_SUFFIX}"
+                return content.strip()
         if attempt == LLM_ATTEMPTS:
             raise LlmUpstreamError(f"LLM 请求失败: {failure}")
         LOGGER.warning(

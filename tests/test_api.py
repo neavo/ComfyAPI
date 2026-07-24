@@ -27,10 +27,12 @@ class FakeService:
         self.submit_value = submit
         self.result_value = result
         self.submissions: list[tuple[object, ...]] = []
+        self.submission_options: list[dict[str, object]] = []
         self.job_ids: list[str] = []
 
-    async def submit(self, *args: object) -> str:
+    async def submit(self, *args: object, **kwargs: object) -> str:
         self.submissions.append(args)
+        self.submission_options.append(kwargs)
         if isinstance(self.submit_value, Exception):
             raise self.submit_value
         return self.submit_value
@@ -111,6 +113,23 @@ async def test_text_to_image_routes_share_submission_contract(path: str) -> None
     assert response.status_code == 202
     assert response.json() == {"id": JOB_ID}
     assert service.submissions == [("生成雨夜街道",)]
+    assert service.submission_options == [{"safe_mode": True}]
+
+
+@pytest.mark.anyio
+async def test_text_to_image_can_disable_safe_mode() -> None:
+    service = FakeService()
+
+    response = await request(
+        "POST",
+        "/text_to_image",
+        text_to_image=service,
+        json={"instruction": "生成雨夜街道", "safe_mode": False},
+    )
+
+    assert response.status_code == 202
+    assert service.submissions == [("生成雨夜街道",)]
+    assert service.submission_options == [{"safe_mode": False}]
 
 
 @pytest.mark.anyio

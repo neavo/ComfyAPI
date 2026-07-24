@@ -35,6 +35,7 @@ class TextToImageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     instruction: str
+    safe_mode: bool = True
 
     @field_validator("instruction")
     @classmethod
@@ -86,7 +87,7 @@ async def text_to_image(
 ) -> IdResponse:
     service: TextToImageService = request.app.state.text_to_image
     try:
-        job_id = await service.submit(body.instruction)
+        job_id = await service.submit(body.instruction, safe_mode=body.safe_mode)
     except InstructionError as error:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)

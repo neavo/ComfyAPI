@@ -8,6 +8,7 @@ from .api import router
 from .comfy import ComfyClient
 from .service import (
     IMAGE_TO_TEXT_WORKFLOW_PATH,
+    SAFETY_PROMPT_PATH,
     TEXT_TO_IMAGE_WORKFLOW_PATH,
     ImageToTextService,
     TextToImageService,
@@ -23,6 +24,7 @@ LOGGER = logging.getLogger(__name__)
 async def lifespan(application: FastAPI):
     settings = load_settings()
     system_prompt = load_system_prompt()
+    safety_prompt = load_system_prompt(SAFETY_PROMPT_PATH)
     text_to_image_workflow = load_workflow(TEXT_TO_IMAGE_WORKFLOW_PATH, "text")
     image_to_text_workflow = load_workflow(IMAGE_TO_TEXT_WORKFLOW_PATH, "image")
     async with (
@@ -36,6 +38,7 @@ async def lifespan(application: FastAPI):
             llm_client,
             settings,
             system_prompt,
+            safety_prompt,
             text_to_image_workflow,
         )
         application.state.image_to_text = ImageToTextService(

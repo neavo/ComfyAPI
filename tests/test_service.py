@@ -68,6 +68,7 @@ def text_to_image(
         client,
         settings(),
         "系统指令",
+        "安全指令",
         service.resolve_workflow(workflow_data(), "text"),
     )
 
@@ -165,7 +166,7 @@ async def test_llm_preprocessing_uses_chat_completions_contract() -> None:
             "生成雨夜街道",
         )
 
-    assert result == f"a rainy neon street\n{service.PROMPT_SUFFIX}"
+    assert result == "a rainy neon street"
     assert captured == {
         "authorization": "Bearer llm-secret",
         "payload": {
@@ -176,6 +177,41 @@ async def test_llm_preprocessing_uses_chat_completions_contract() -> None:
             ],
         },
     }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("safe_mode", "system_prompt", "prefix"),
+    [
+        (True, "系统指令\n\n安全指令", "a rainy neon street\nsafe\n"),
+        (False, "系统指令", "a rainy neon street\n"),
+    ],
+)
+async def test_text_to_image_safe_mode_controls_system_prompt_and_tag(
+    safe_mode: bool,
+    system_prompt: str,
+    prefix: str,
+) -> None:
+    captured: dict[str, object] = {}
+    comfy = FakeComfy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "a rainy neon street"}}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await text_to_image(client, comfy).submit("生成雨夜街道", safe_mode=safe_mode)
+
+    assert captured["messages"] == [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "生成雨夜街道"},
+    ]
+    prompt = comfy.submissions[0][1]["10"]["inputs"]["text"]
+    assert prompt == f"{prefix}{service.PROMPT_SUFFIX}"
+    assert "(mature:-1), aged down" in prompt
 
 
 @pytest.mark.anyio
@@ -211,7 +247,7 @@ async def test_llm_retries_one_transient_failure(
             "生成雨夜",
         )
 
-    assert result.startswith("retry success\n")
+    assert result == "retry success"
     assert attempts == 2
     assert sleeps == [service.RETRY_DELAY]
 
@@ -304,7 +340,17 @@ def test_build_workflow_only_randomizes_seeds_when_requested(monkeypatch) -> Non
 
 
 @pytest.mark.anyio
-async def test_text_to_image_passthrough_skips_llm() -> None:
+@pytest.mark.parametrize(
+    ("safe_mode", "prefix"),
+    [
+        (True, "保留 中间 空格\nsafe\n"),
+        (False, "保留 中间 空格\n"),
+    ],
+)
+async def test_text_to_image_passthrough_skips_llm(
+    safe_mode: bool,
+    prefix: str,
+) -> None:
     comfy = FakeComfy()
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -314,12 +360,14 @@ async def test_text_to_image_passthrough_skips_llm() -> None:
         transport=httpx.MockTransport(handler),
     ) as client:
         job_id = await text_to_image(client, comfy).submit(
-            "保留 启用透传模式中间启用透传模式 空格"
+            "保留 启用透传模式中间启用透传模式 空格",
+            safe_mode=safe_mode,
         )
 
     assert comfy.submissions[0][0] == job_id
-    assert comfy.submissions[0][1]["10"]["inputs"]["text"] == (
-        f"保留 中间 空格\n{service.PROMPT_SUFFIX}"
+    assert (
+        comfy.submissions[0][1]["10"]["inputs"]["text"]
+        == f"{prefix}{service.PROMPT_SUFFIX}"
     )
 
 

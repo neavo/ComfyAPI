@@ -22,6 +22,7 @@ llm_url = "OpenAI 兼容的 Chat Completions 完整地址"
 llm_api_key = "文生图指令扩写使用的 LLM API Key"
 llm_model = "文生图指令扩写使用的模型名"
 tg_bot_token = "Telegram Bot Token，仅机器人需要"
+tg_safe_mode_exempt_chat_ids = [...]
 ```
 
 同时确保 `prompt/system.md` 非空。
@@ -47,7 +48,8 @@ uv run python -m app.telegram
 ```
 
 Windows 也可分别运行 `app_api.bat` 和 `app_tgbot.bat`。Telegram 使用
-`api_token.txt` 调用本机 `http://127.0.0.1:48188`，不直连 ComfyUI 或 LLM。
+`config/config.toml` 中的 `api_token` 调用本机 `http://127.0.0.1:48188`，
+不直连 ComfyUI 或 LLM。
 
 ## HTTP API
 
@@ -63,10 +65,11 @@ Authorization: Bearer TOKEN
 POST /text_to_image
 Content-Type: application/json
 
-{"instruction":"一只戴耳机的橘猫"}
+{"instruction":"一只戴耳机的橘猫","safe_mode":true}
 ```
 
-`instruction` 长度为 1～4096 个字符。成功返回 HTTP 202：
+`instruction` 长度为 1～4096 个字符。`safe_mode` 默认为 `true`；关闭后不向
+LLM 添加安全处理指令，也不在最终提示词中添加 `safe` 标签。成功返回 HTTP 202：
 
 ```json
 {"id":"550e8400-e29b-41d4-a716-446655440000"}
@@ -129,6 +132,7 @@ $caption = Invoke-RestMethod -Method Post `
 - 私聊发送文字：生成图片。
 - 私聊直接发送照片或 JPEG、PNG、WebP 图片文件：反推提示词。
 - 群聊中，文字或图片说明必须以 `@机器人用户名` 开头。
+- `tg_safe_mode_exempt_chat_ids` 中的群聊文生图请求使用 `safe_mode=false`。
 - `/start` 显示使用提示。
 
 在 BotFather 中关闭 **Group Privacy Mode** 后再将机器人加入群组。机器人使用

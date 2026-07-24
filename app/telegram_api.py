@@ -52,10 +52,14 @@ class BackendApi:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
 
-    async def submit_text_to_image(self, instruction: str) -> str:
+    async def submit_text_to_image(
+        self,
+        instruction: str,
+        safe_mode: bool,
+    ) -> str:
         return await self._submit(
             "/text_to_image",
-            json={"instruction": instruction},
+            json={"instruction": instruction, "safe_mode": safe_mode},
         )
 
     async def submit_image_to_text(self, image: bytes, media_type: str) -> str:

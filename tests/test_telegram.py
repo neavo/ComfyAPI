@@ -12,6 +12,7 @@ from app.telegram import (
     TextToImageJob,
     extract_image,
     extract_instruction,
+    load_safe_mode_exempt_chat_ids,
 )
 from app.telegram_api import (
     MAX_IMAGE_BYTES,
@@ -30,6 +31,7 @@ def update(
     document: object | None = None,
     update_id: int = 1,
     message_id: int = 7,
+    chat_id: int = -1001,
     chat_type: str = "supergroup",
     is_bot: bool = False,
     thread_id: int | None = 11,
@@ -37,7 +39,7 @@ def update(
     message: dict[str, object] = {
         "message_id": message_id,
         "from": {"is_bot": is_bot},
-        "chat": {"id": -1001, "type": chat_type},
+        "chat": {"id": chat_id, "type": chat_type},
     }
     if text is not None:
         message["text"] = text
@@ -95,6 +97,7 @@ class FakeBackend:
         text_results: list[object] | None = None,
     ) -> None:
         self.instructions: list[str] = []
+        self.safe_modes: list[bool] = []
         self.images: list[tuple[bytes, str]] = []
         self.image_results = iter(
             image_results
@@ -108,8 +111,13 @@ class FakeBackend:
         )
         self.result_calls = 0
 
-    async def submit_text_to_image(self, instruction: str) -> str:
+    async def submit_text_to_image(
+        self,
+        instruction: str,
+        safe_mode: bool,
+    ) -> str:
         self.instructions.append(instruction)
+        self.safe_modes.append(safe_mode)
         return f"image-{len(self.instructions)}"
 
     async def submit_image_to_text(self, image: bytes, media_type: str) -> str:
@@ -203,8 +211,42 @@ async def test_private_text_generates_and_replies_with_photo() -> None:
     await drain_queue(bot)
 
     assert backend.instructions == ["画一只猫"]
-    assert [text for _, text in telegram.messages] == ["正在生成…"]
+    assert backend.safe_modes == [True]
+    assert [text for _, text in telegram.messages] == ["正在生成图片，请稍后 …"]
     assert telegram.photos[0][1:] == (b"WEBP", "image/webp")
+
+
+@pytest.mark.anyio
+async def test_safe_mode_is_disabled_only_for_configured_group() -> None:
+    telegram = FakeTelegram()
+    backend = FakeBackend(
+        image_results=[
+            ImageApiResult("completed", b"WEBP", "image/webp"),
+            ImageApiResult("completed", b"WEBP", "image/webp"),
+            ImageApiResult("completed", b"WEBP", "image/webp"),
+        ]
+    )
+    bot = TelegramBot(telegram, backend, frozenset({-1001}))
+
+    await bot.accept_update(update(chat_id=-1001), "PainterBot")
+    await bot.accept_update(update(chat_id=-2002), "PainterBot")
+    await bot.accept_update(
+        update("画猫", chat_id=-1001, chat_type="private"),
+        "PainterBot",
+    )
+    await drain_queue(bot)
+
+    assert backend.safe_modes == [False, True, True]
+
+
+def test_safe_mode_exempt_chat_ids_default_and_validation() -> None:
+    assert load_safe_mode_exempt_chat_ids({}) == frozenset()
+    assert load_safe_mode_exempt_chat_ids(
+        {"tg_safe_mode_exempt_chat_ids": [-1001, -1002, -1001]}
+    ) == frozenset({-1001, -1002})
+
+    with pytest.raises(RuntimeError, match="tg_safe_mode_exempt_chat_ids"):
+        load_safe_mode_exempt_chat_ids({"tg_safe_mode_exempt_chat_ids": ["-1001"]})
 
 
 @pytest.mark.anyio
@@ -230,7 +272,7 @@ async def test_private_photo_downloads_and_returns_prompt() -> None:
     assert telegram.downloads == ["large"]
     assert backend.images == [(b"IMAGE", "image/jpeg")]
     assert [text for _, text in telegram.messages] == [
-        "正在反推提示词…",
+        "正在反推提示词，请稍后 …",
         "reverse prompt",
     ]
 
@@ -408,8 +450,13 @@ async def test_task_failures_return_stable_messages(
 @pytest.mark.anyio
 async def test_expired_job_does_not_block_next_job() -> None:
     class TimeoutBackend(FakeBackend):
-        async def submit_text_to_image(self, instruction: str) -> str:
+        async def submit_text_to_image(
+            self,
+            instruction: str,
+            safe_mode: bool,
+        ) -> str:
             self.instructions.append(instruction)
+            self.safe_modes.append(safe_mode)
             if instruction == "超时任务":
                 await asyncio.Future()
             return "job-ok"
