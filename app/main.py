@@ -5,6 +5,7 @@ import httpx
 from fastapi import FastAPI
 
 from .api import router
+from .comfy import ComfyClient
 from .service import (
     GenerationService,
     load_settings,
@@ -26,7 +27,7 @@ async def lifespan(application: FastAPI):
     ):
         application.state.settings = settings
         application.state.generation = GenerationService(
-            comfy_client,
+            ComfyClient(comfy_client, workflow.output_node_id),
             llm_client,
             settings,
             system_prompt,

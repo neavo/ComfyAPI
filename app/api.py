@@ -7,11 +7,11 @@ from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from .comfy import ComfyError
 from .service import (
     GenerationService,
     InstructionError,
     LlmUpstreamError,
-    UpstreamError,
     normalize_instruction,
 )
 
@@ -67,7 +67,7 @@ async def new_job(
     except LlmUpstreamError as error:
         LOGGER.error("指令预处理失败：%s", error)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, LLM_UPSTREAM_DETAIL) from error
-    except UpstreamError as error:
+    except ComfyError as error:
         LOGGER.error("任务提交失败：%s", error)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, UPSTREAM_DETAIL) from error
     LOGGER.info("任务 %s 提交成功", job_id)
@@ -80,12 +80,12 @@ async def result(id: UUID, request: Request, _: None = Depends(authenticate)):
     generation: GenerationService = request.app.state.generation
     try:
         output = await generation.result(job_id)
-    except UpstreamError as error:
+    except ComfyError as error:
         LOGGER.error("任务 %s 查询失败：%s", job_id, error)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, UPSTREAM_DETAIL) from error
     LOGGER.info("任务 %s 状态：%s", job_id, output.status)
     if output.status == "processing":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Task is still processing")
+        return Response(status_code=status.HTTP_202_ACCEPTED)
     if output.status == "completed":
         return Response(content=output.image, media_type=output.media_type)
     if output.status == "failed":

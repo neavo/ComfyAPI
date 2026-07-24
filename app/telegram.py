@@ -52,7 +52,7 @@ def extract_instruction(text: str, username: str) -> str | None:
 
 @dataclass(frozen=True, slots=True)
 class GenerationResult:
-    status: Literal["completed", "failed"]
+    status: Literal["completed", "failed", "missing"]
     image: bytes | None = None
     media_type: str | None = None
 
@@ -99,8 +99,10 @@ class GenerationApi:
             )
         if response.status_code == 502:
             raise TransientGenerationApiError("查询响应异常：HTTP 502")
-        if response.status_code in {400, 404}:
+        if response.status_code == 202:
             return None
+        if response.status_code == 404:
+            return GenerationResult("missing")
         if response.status_code == 500:
             return GenerationResult("failed")
         raise GenerationApiError(f"查询响应异常：HTTP {response.status_code}")
@@ -419,6 +421,15 @@ class TelegramBot:
             await self.api.send_message(reply, "生成失败，请重试")
             LOGGER.error(
                 "Telegram 生成失败：chat_id=%s message_id=%s job_id=%s",
+                job.chat_id,
+                job.message_id,
+                job_id,
+            )
+            return
+        if result.status == "missing":
+            await self.api.send_message(reply, "生成任务已丢失，请重试")
+            LOGGER.error(
+                "Telegram 生成任务丢失：chat_id=%s message_id=%s job_id=%s",
                 job.chat_id,
                 job.message_id,
                 job_id,

@@ -55,8 +55,8 @@ async def test_generation_api_submits_authenticated_instruction() -> None:
     ("status", "body", "expected"),
     [
         (200, b"WEBP", "completed"),
-        (400, b"{}", None),
-        (404, b"{}", None),
+        (202, b"", None),
+        (404, b"{}", "missing"),
         (500, b"{}", "failed"),
     ],
 )
@@ -467,6 +467,7 @@ async def test_polling_survives_pending_and_transient_results() -> None:
     ("result", "expected"),
     [
         (GenerationResult("failed"), "生成失败，请重试"),
+        (GenerationResult("missing"), "生成任务已丢失，请重试"),
         (GenerationApiError("协议异常"), "生图服务暂时异常，请稍后重试"),
     ],
 )

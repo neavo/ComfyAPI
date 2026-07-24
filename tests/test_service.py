@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.comfy import GenerationResult
 from app import service
 
 
@@ -32,9 +33,27 @@ def settings() -> service.Settings:
     )
 
 
-def generation(client: httpx.AsyncClient) -> service.GenerationService:
+class FakeComfy:
+    def __init__(
+        self,
+        result: GenerationResult = GenerationResult("missing"),
+    ) -> None:
+        self.result_value = result
+        self.submissions: list[tuple[str, dict[str, object]]] = []
+
+    async def submit(self, job_id: str, prompt: dict[str, object]) -> None:
+        self.submissions.append((job_id, prompt))
+
+    async def result(self, _: str) -> GenerationResult:
+        return self.result_value
+
+
+def generation(
+    client: httpx.AsyncClient,
+    comfy: FakeComfy | None = None,
+) -> service.GenerationService:
     return service.GenerationService(
-        client,
+        comfy or FakeComfy(),
         client,
         settings(),
         "系统指令",
@@ -183,7 +202,7 @@ async def test_llm_permanent_failure_is_not_retried() -> None:
         return httpx.Response(400)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(service.UpstreamError):
+        with pytest.raises(service.LlmUpstreamError):
             await service.preprocess_instruction(
                 client,
                 settings(),
@@ -248,74 +267,22 @@ def test_build_prompt_copies_template_and_randomizes_seeds(monkeypatch) -> None:
     assert template.data == original
 
 
-def successful_history(*images: dict[str, object]) -> dict[str, object]:
-    return {
-        "job-id": {
-            "status": {"status_str": "success"},
-            "outputs": {"20": {"images": list(images)}},
-        }
-    }
-
-
-def test_history_selects_first_output_image() -> None:
-    history = successful_history(
-        {"filename": "preview.png", "subfolder": "temp", "type": "temp"},
-        {"filename": "final.png", "subfolder": "api\\job", "type": "output"},
-        {"filename": "second.png", "subfolder": "api", "type": "output"},
-    )
-    history["job-id"]["outputs"]["99"] = {
-        "images": [{"filename": "other.png", "subfolder": "", "type": "output"}]
-    }
-
-    assert service.parse_history(history, "job-id", "20") == {
-        "filename": "final.png",
-        "subfolder": "api/job",
-        "type": "output",
-    }
-
-
-def test_history_reports_missing_failed_and_damaged_results() -> None:
-    assert service.parse_history({}, "job-id", "20") is None
-    assert (
-        service.parse_history(
-            {"job-id": {"status": {"status_str": "error"}}},
-            "job-id",
-            "20",
-        )
-        == "failed"
-    )
-    with pytest.raises(service.UpstreamError):
-        service.parse_history(successful_history(), "job-id", "20")
-
-
-@pytest.mark.parametrize("section", ["queue_running", "queue_pending"])
-def test_queue_recognizes_running_or_pending_job(section: str) -> None:
-    queue = {"queue_running": [], "queue_pending": []}
-    queue[section] = [[1, "job-id"]]
-
-    assert service.is_queued(queue, "job-id") is True
-    assert service.is_queued(queue, "other-id") is False
-
-
 @pytest.mark.anyio
 async def test_passthrough_submission_skips_llm_and_removes_markers() -> None:
-    captured: dict[str, object] = {}
+    comfy = FakeComfy()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/prompt"
-        captured.update(json.loads(request.content))
-        return httpx.Response(200, json={"prompt_id": captured["prompt_id"]})
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("透传模式不应访问 LLM")
 
     async with httpx.AsyncClient(
-        base_url="http://comfy.local",
         transport=httpx.MockTransport(handler),
     ) as client:
-        job_id = await generation(client).submit(
+        job_id = await generation(client, comfy).submit(
             "保留 启用透传模式中间启用透传模式 空格"
         )
 
-    assert captured["prompt_id"] == job_id
-    assert captured["prompt"]["10"]["inputs"]["text"] == (
+    assert comfy.submissions[0][0] == job_id
+    assert comfy.submissions[0][1]["10"]["inputs"]["text"] == (
         f"保留 中间 空格\n{service.PROMPT_SUFFIX}"
     )
 
@@ -326,7 +293,6 @@ async def test_passthrough_without_instruction_is_rejected_before_submission() -
         raise AssertionError("不应访问上游")
 
     async with httpx.AsyncClient(
-        base_url="http://comfy.local",
         transport=httpx.MockTransport(handler),
     ) as client:
         with pytest.raises(service.InstructionError):
@@ -342,82 +308,9 @@ async def test_llm_failure_is_distinguished_from_comfy_failure() -> None:
         return httpx.Response(200, json={"choices": []})
 
     async with httpx.AsyncClient(
-        base_url="http://comfy.local",
         transport=httpx.MockTransport(handler),
     ) as client:
         with pytest.raises(service.LlmUpstreamError):
             await generation(client).submit("生成雨夜")
 
     assert paths == ["/v1/chat/completions"]
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("queue", "expected"),
-    [
-        ({"queue_running": [], "queue_pending": [[1, "job-id"]]}, "processing"),
-        ({"queue_running": [], "queue_pending": []}, "missing"),
-    ],
-)
-async def test_missing_history_falls_back_to_queue(
-    queue: dict[str, object],
-    expected: str,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, json={} if request.url.path.startswith("/history") else queue
-        )
-
-    async with httpx.AsyncClient(
-        base_url="http://comfy.local",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        result = await generation(client).result("job-id")
-
-    assert result.status == expected
-
-
-@pytest.mark.anyio
-async def test_completed_result_downloads_selected_image() -> None:
-    requested_view: dict[str, str] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/view":
-            requested_view.update(request.url.params)
-            return httpx.Response(
-                200,
-                content=b"WEBP",
-                headers={"content-type": "image/webp"},
-            )
-        return httpx.Response(
-            200,
-            json=successful_history(
-                {"filename": "final.webp", "subfolder": "api", "type": "output"}
-            ),
-        )
-
-    async with httpx.AsyncClient(
-        base_url="http://comfy.local",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        result = await generation(client).result("job-id")
-
-    assert result == service.GenerationResult("completed", b"WEBP", "image/webp")
-    assert requested_view == {
-        "filename": "final.webp",
-        "subfolder": "api",
-        "type": "output",
-    }
-
-
-@pytest.mark.anyio
-async def test_upstream_failure_raises_stable_service_error() -> None:
-    def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(503)
-
-    async with httpx.AsyncClient(
-        base_url="http://comfy.local",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        with pytest.raises(service.UpstreamError):
-            await generation(client).result("job-id")

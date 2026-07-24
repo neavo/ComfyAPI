@@ -4,11 +4,10 @@ import httpx
 import pytest
 
 from app.main import app
+from app.comfy import ComfyError, GenerationResult
 from app.service import (
-    GenerationResult,
     InstructionError,
     LlmUpstreamError,
-    UpstreamError,
 )
 
 JOB_ID = "550e8400-e29b-41d4-a716-446655440000"
@@ -123,7 +122,7 @@ async def test_new_rejects_invalid_request_body(body: object) -> None:
     [
         (InstructionError("无有效指令"), 422, "无有效指令"),
         (LlmUpstreamError("敏感 LLM 错误"), 502, "LLM upstream error"),
-        (UpstreamError("敏感节点错误"), 502, "ComfyUI upstream error"),
+        (ComfyError("敏感节点错误"), 502, "ComfyUI upstream error"),
     ],
 )
 async def test_new_maps_service_errors_to_public_responses(
@@ -147,7 +146,6 @@ async def test_new_maps_service_errors_to_public_responses(
 @pytest.mark.parametrize(
     ("result", "status_code", "detail"),
     [
-        (GenerationResult("processing"), 400, "Task is still processing"),
         (GenerationResult("failed"), 500, "generation failed"),
         (GenerationResult("missing"), 404, "Task not found"),
     ],
@@ -164,6 +162,18 @@ async def test_result_maps_service_status(
     assert response.status_code == status_code
     assert response.json() == {"detail": detail}
     assert generation.job_ids == [JOB_ID]
+
+
+@pytest.mark.anyio
+async def test_result_returns_202_while_processing() -> None:
+    response = await request(
+        "GET",
+        f"/result/{JOB_ID}",
+        FakeGeneration(result=GenerationResult("processing")),
+    )
+
+    assert response.status_code == 202
+    assert response.content == b""
 
 
 @pytest.mark.anyio
@@ -184,7 +194,7 @@ async def test_result_sanitizes_upstream_error() -> None:
     response = await request(
         "GET",
         f"/result/{JOB_ID}",
-        FakeGeneration(result=UpstreamError("内部错误")),
+        FakeGeneration(result=ComfyError("内部错误")),
     )
 
     assert response.status_code == 502
