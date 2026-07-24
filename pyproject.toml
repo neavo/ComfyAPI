@@ -1,7 +1,7 @@
 [project]
 name = "comfy-instruction-api"
-version = "0.1.0"
-description = "复用现有 ComfyUI 队列的指令生图 API"
+version = "0.2.0"
+description = "复用现有 ComfyUI 队列的文生图与图生文 API"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

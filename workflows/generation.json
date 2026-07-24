@@ -32,7 +32,7 @@
     },
     "class_type": "Save Image (LoraManager)",
     "_meta": {
-      "title": "API Output"
+      "title": "api_output"
     }
   },
   "294": {
@@ -81,7 +81,7 @@
     },
     "class_type": "CLIPTextEncode",
     "_meta": {
-      "title": "API Instruction"
+      "title": "api_input"
     }
   },
   "387": {

@@ -1,44 +1,56 @@
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, TypeVar
 
 import httpx
 
-from .service import PROJECT_ROOT, read_required
+from .service import IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, PROJECT_ROOT, read_required
+from .telegram_api import (
+    RECONNECT_DELAY,
+    BackendApi,
+    BackendApiError,
+    TelegramApi,
+    TelegramError,
+    TransientBackendApiError,
+)
 
 WORKER_COUNT = 2
 QUEUE_CAPACITY = 20
-RECONNECT_DELAY = 3.0
 JOB_TIMEOUT = 180.0
-OUTBOUND_ATTEMPTS = 3
 RESULT_POLL_DELAY = 3.0
-TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
-GENERATION_API_URL = "http://127.0.0.1:48188"
+TELEGRAM_MESSAGE_LIMIT = 4096
+API_URL = "http://127.0.0.1:48188"
 LOGGER = logging.getLogger(__name__)
-
-
-class TelegramError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        retryable: bool = False,
-        retry_after: float | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.retryable = retryable
-        self.retry_after = retry_after
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
-class TelegramJob:
+class TextToImageJob:
     chat_id: int
     message_id: int
     message_thread_id: int | None
     instruction: str
     deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class ImageToTextJob:
+    chat_id: int
+    message_id: int
+    message_thread_id: int | None
+    file_id: str
+    media_type: str
+    deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class ImageAttachment:
+    file_id: str
+    media_type: str
+    size: int | None
 
 
 def extract_instruction(text: str, username: str) -> str | None:
@@ -50,190 +62,74 @@ def extract_instruction(text: str, username: str) -> str | None:
     return text[len(mention) :].strip()
 
 
-@dataclass(frozen=True, slots=True)
-class GenerationResult:
-    status: Literal["completed", "failed", "missing"]
-    image: bytes | None = None
-    media_type: str | None = None
-
-
-class GenerationApiError(RuntimeError):
-    pass
-
-
-class TransientGenerationApiError(GenerationApiError):
-    pass
-
-
-class GenerationApi:
-    def __init__(self, client: httpx.AsyncClient) -> None:
-        self.client = client
-
-    async def submit(self, instruction: str) -> str:
-        try:
-            response = await self.client.post("/new", json={"instruction": instruction})
-        except httpx.RequestError as error:
-            raise GenerationApiError(f"提交请求失败：{type(error).__name__}") from None
-        if response.status_code != 202:
-            raise GenerationApiError(f"提交响应异常：HTTP {response.status_code}")
-        try:
-            job_id = response.json()["id"]
-        except (ValueError, KeyError, TypeError):
-            raise GenerationApiError("提交响应缺少任务 ID") from None
-        if not isinstance(job_id, str):
-            raise GenerationApiError("提交响应缺少任务 ID")
-        return job_id
-
-    async def result(self, job_id: str) -> GenerationResult | None:
-        try:
-            response = await self.client.get(f"/result/{job_id}")
-        except httpx.RequestError as error:
-            raise TransientGenerationApiError(
-                f"查询请求失败：{type(error).__name__}"
-            ) from None
-        if response.status_code == 200:
-            if not response.content:
-                raise GenerationApiError("完成响应图片为空")
-            return GenerationResult(
-                "completed", response.content, response.headers.get("content-type")
+def extract_image(message: dict[str, Any]) -> ImageAttachment | None:
+    photos = message.get("photo")
+    if isinstance(photos, list):
+        candidates = [
+            photo
+            for photo in photos
+            if isinstance(photo, dict) and isinstance(photo.get("file_id"), str)
+        ]
+        if candidates:
+            photo = max(
+                candidates,
+                key=lambda item: (
+                    item.get("file_size")
+                    if isinstance(item.get("file_size"), int)
+                    else 0,
+                    (
+                        item.get("width") * item.get("height")
+                        if isinstance(item.get("width"), int)
+                        and isinstance(item.get("height"), int)
+                        else 0
+                    ),
+                ),
             )
-        if response.status_code == 502:
-            raise TransientGenerationApiError("查询响应异常：HTTP 502")
-        if response.status_code == 202:
-            return None
-        if response.status_code == 404:
-            return GenerationResult("missing")
-        if response.status_code == 500:
-            return GenerationResult("failed")
-        raise GenerationApiError(f"查询响应异常：HTTP {response.status_code}")
-
-
-class TelegramApi:
-    def __init__(self, token: str, client: httpx.AsyncClient) -> None:
-        self.token = token
-        self.client = client
-
-    async def get_username(self) -> str:
-        result = await self._call("getMe")
-        username = result.get("username") if isinstance(result, dict) else None
-        if not isinstance(username, str) or not username:
-            raise TelegramError("getMe 响应缺少机器人用户名", retryable=True)
-        return username
-
-    async def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
-        data = {"timeout": "30", "allowed_updates": json.dumps(["message"])}
-        if offset is not None:
-            data["offset"] = str(offset)
-        result = await self._call("getUpdates", data)
-        if not isinstance(result, list) or not all(
-            isinstance(update, dict) for update in result
-        ):
-            raise TelegramError("getUpdates 响应不是更新列表", retryable=True)
-        return result
-
-    async def send_message(self, reply: dict[str, str], text: str) -> bool:
-        return await self._send("sendMessage", {**reply, "text": text})
-
-    async def send_photo(
-        self, reply: dict[str, str], image: bytes, media_type: str
-    ) -> bool:
-        return await self._send(
-            "sendPhoto",
-            reply,
-            {"photo": ("result.webp", image, media_type)},
-        )
-
-    async def _send(
-        self,
-        method: str,
-        data: dict[str, str],
-        files: dict[str, tuple[str, bytes, str]] | None = None,
-    ) -> bool:
-        for attempt in range(1, OUTBOUND_ATTEMPTS + 1):
-            try:
-                await self._call(method, data, files)
-                return True
-            except TelegramError as error:
-                if not error.retryable or attempt == OUTBOUND_ATTEMPTS:
-                    LOGGER.error(
-                        "Telegram %s 第 %s/%s 次失败后停止：%s",
-                        method,
-                        attempt,
-                        OUTBOUND_ATTEMPTS,
-                        error,
-                    )
-                    return False
-                delay = (
-                    error.retry_after
-                    if error.retry_after is not None
-                    else RECONNECT_DELAY
-                )
-                LOGGER.warning(
-                    "Telegram %s 第 %s/%s 次失败（%s），%.1f 秒后重试",
-                    method,
-                    attempt,
-                    OUTBOUND_ATTEMPTS,
-                    error,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-
-    async def _call(
-        self,
-        method: str,
-        data: dict[str, str] | None = None,
-        files: dict[str, tuple[str, bytes, str]] | None = None,
-    ) -> object:
-        try:
-            response = await self.client.post(
-                f"/bot{self.token}/{method}", data=data, files=files
+            size = photo.get("file_size")
+            return ImageAttachment(
+                photo["file_id"],
+                "image/jpeg",
+                size if isinstance(size, int) else None,
             )
-        except httpx.RequestError as error:
-            raise TelegramError(
-                f"请求失败：{type(error).__name__}", retryable=True
-            ) from None
 
-        try:
-            payload = response.json()
-        except ValueError as error:
-            retryable = response.is_success or response.status_code in (
-                {429} | TRANSIENT_STATUS_CODES
-            )
-            raise TelegramError("响应不是合法 JSON", retryable=retryable) from error
+    document = message.get("document")
+    if not isinstance(document, dict):
+        return None
+    file_id = document.get("file_id")
+    media_type = document.get("mime_type")
+    size = document.get("file_size")
+    if not isinstance(file_id, str) or media_type not in IMAGE_MEDIA_TYPES:
+        return None
+    return ImageAttachment(
+        file_id,
+        media_type,
+        size if isinstance(size, int) else None,
+    )
 
-        description = payload.get("description") if isinstance(payload, dict) else None
-        message = (
-            description
-            if isinstance(description, str)
-            else f"HTTP {response.status_code}"
-        )
 
-        if response.status_code == 429:
-            parameters = (
-                payload.get("parameters") if isinstance(payload, dict) else None
-            )
-            retry_after = (
-                parameters.get("retry_after") if isinstance(parameters, dict) else None
-            )
-            if not isinstance(retry_after, (int, float)) or retry_after < 0:
-                retry_after = None
-            raise TelegramError(message, retryable=True, retry_after=retry_after)
-        if response.status_code in TRANSIENT_STATUS_CODES:
-            raise TelegramError(message, retryable=True)
-        if (
-            response.is_error
-            or not isinstance(payload, dict)
-            or payload.get("ok") is not True
-        ):
-            raise TelegramError(message)
-        return payload.get("result")
+def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    chunks: list[str] = []
+    remaining = text.strip()
+    while len(remaining) > limit:
+        newline = remaining.rfind("\n", 0, limit + 1)
+        space = remaining.rfind(" ", 0, limit + 1)
+        cut = max(newline, space)
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 class TelegramBot:
-    def __init__(self, api: TelegramApi, generation: GenerationApi) -> None:
+    def __init__(self, api: TelegramApi, backend: BackendApi) -> None:
         self.api = api
-        self.generation = generation
-        self.queue: asyncio.Queue[TelegramJob] = asyncio.Queue(QUEUE_CAPACITY)
+        self.backend = backend
+        self.queue: asyncio.Queue[TextToImageJob | ImageToTextJob] = asyncio.Queue(
+            QUEUE_CAPACITY
+        )
 
     async def run(self) -> None:
         username = await self._username()
@@ -286,7 +182,6 @@ class TelegramBot:
             return
         sender = message.get("from")
         chat = message.get("chat")
-        text = message.get("text")
         message_id = message.get("message_id")
         chat_type = chat.get("type") if isinstance(chat, dict) else None
         if (
@@ -296,18 +191,48 @@ class TelegramBot:
             or chat_type not in {"private", "group", "supergroup"}
             or not isinstance(chat.get("id"), int)
             or not isinstance(message_id, int)
-            or not isinstance(text, str)
         ):
             return
 
         thread_id = message.get("message_thread_id")
         reply = self.reply_data(chat["id"], message_id, thread_id)
+        attachment = extract_image(message)
+        if attachment is not None:
+            if chat_type != "private":
+                caption = message.get("caption")
+                if (
+                    not isinstance(caption, str)
+                    or extract_instruction(caption, username) is None
+                ):
+                    return
+            if attachment.size is not None and attachment.size > MAX_IMAGE_BYTES:
+                await self.api.send_message(reply, "图片不能超过 10 MiB")
+                return
+            await self._enqueue(
+                ImageToTextJob(
+                    chat["id"],
+                    message_id,
+                    thread_id if isinstance(thread_id, int) else None,
+                    attachment.file_id,
+                    attachment.media_type,
+                    asyncio.get_running_loop().time() + JOB_TIMEOUT,
+                ),
+                reply,
+            )
+            return
+
+        text = message.get("text")
+        if not isinstance(text, str):
+            return
         if chat_type == "private":
             instruction = text.strip()
             if instruction:
                 command = instruction.split(maxsplit=1)[0].casefold()
                 if command in {"/start", f"/start@{username}".casefold()}:
-                    await self.api.send_message(reply, "请直接发送生图描述")
+                    await self.api.send_message(
+                        reply,
+                        "发送文字生成图片；直接发送图片可反推提示词",
+                    )
                     return
                 if instruction.startswith("/"):
                     return
@@ -327,19 +252,26 @@ class TelegramBot:
         if len(instruction) > 4096:
             await self.api.send_message(reply, "生图描述长度必须为 1 至 4096 个字符")
             return
-        if self.queue.full():
-            await self.api.send_message(reply, "当前生成任务较多，请稍后再试")
-            return
-
-        self.queue.put_nowait(
-            TelegramJob(
+        await self._enqueue(
+            TextToImageJob(
                 chat["id"],
                 message_id,
                 thread_id if isinstance(thread_id, int) else None,
                 instruction,
                 asyncio.get_running_loop().time() + JOB_TIMEOUT,
-            )
+            ),
+            reply,
         )
+
+    async def _enqueue(
+        self,
+        job: TextToImageJob | ImageToTextJob,
+        reply: dict[str, str],
+    ) -> None:
+        if self.queue.full():
+            await self.api.send_message(reply, "当前任务较多，请稍后再试")
+            return
+        self.queue.put_nowait(job)
 
     async def worker(self, worker_id: int) -> None:
         while True:
@@ -352,7 +284,7 @@ class TelegramBot:
                     reply = self.reply_data(
                         job.chat_id, job.message_id, job.message_thread_id
                     )
-                    await self.api.send_message(reply, "生成超时，请稍后重试")
+                    await self.api.send_message(reply, "任务超时，请稍后重试")
                     LOGGER.error(
                         "Telegram 任务超时：worker=%s chat_id=%s message_id=%s",
                         worker_id,
@@ -369,45 +301,27 @@ class TelegramBot:
             finally:
                 self.queue.task_done()
 
-    async def _process(self, job: TelegramJob) -> None:
-        reply = self.reply_data(job.chat_id, job.message_id, job.message_thread_id)
-        if not await self.api.send_message(reply, "正在生成…"):
-            LOGGER.error(
-                "Telegram 状态消息交付失败，继续生成：chat_id=%s message_id=%s",
-                job.chat_id,
-                job.message_id,
-            )
+    async def _process(self, job: TextToImageJob | ImageToTextJob) -> None:
+        if isinstance(job, TextToImageJob):
+            await self._process_text_to_image(job)
+        else:
+            await self._process_image_to_text(job)
 
+    async def _process_text_to_image(self, job: TextToImageJob) -> None:
+        reply = self.reply_data(job.chat_id, job.message_id, job.message_thread_id)
+        await self._send_progress(reply, "正在生成…", job)
         job_id: str | None = None
         try:
-            job_id = await self.generation.submit(job.instruction)
-            while True:
-                await asyncio.sleep(RESULT_POLL_DELAY)
-                try:
-                    result = await self.generation.result(job_id)
-                except TransientGenerationApiError as error:
-                    result = None
-                    LOGGER.warning(
-                        "生成 API 查询瞬时失败：chat_id=%s message_id=%s "
-                        "job_id=%s error=%s",
-                        job.chat_id,
-                        job.message_id,
-                        job_id,
-                        error,
-                    )
-                if result is not None:
-                    break
-                LOGGER.info(
-                    "生成 API 尚无结果：chat_id=%s message_id=%s job_id=%s，"
-                    "%.1f 秒后重试",
-                    job.chat_id,
-                    job.message_id,
-                    job_id,
-                    RESULT_POLL_DELAY,
-                )
-        except GenerationApiError as error:
+            job_id = await self.backend.submit_text_to_image(job.instruction)
+            result = await self._poll(
+                job_id,
+                self.backend.text_to_image_result,
+                job,
+                "文生图",
+            )
+        except BackendApiError as error:
             LOGGER.error(
-                "Telegram 生成 API 任务失败：chat_id=%s message_id=%s "
+                "Telegram 文生图 API 任务失败：chat_id=%s message_id=%s "
                 "job_id=%s error=%s",
                 job.chat_id,
                 job.message_id,
@@ -419,35 +333,126 @@ class TelegramBot:
 
         if result.status == "failed":
             await self.api.send_message(reply, "生成失败，请重试")
-            LOGGER.error(
-                "Telegram 生成失败：chat_id=%s message_id=%s job_id=%s",
-                job.chat_id,
-                job.message_id,
-                job_id,
-            )
             return
         if result.status == "missing":
             await self.api.send_message(reply, "生成任务已丢失，请重试")
-            LOGGER.error(
-                "Telegram 生成任务丢失：chat_id=%s message_id=%s job_id=%s",
-                job.chat_id,
-                job.message_id,
-                job_id,
-            )
             return
-        if result.status != "completed" or result.image is None:
-            raise RuntimeError(f"result 返回意外状态：{result.status}")
+        if result.image is None:
+            raise RuntimeError("文生图完成结果缺少图片")
         delivered = await self.api.send_photo(
-            reply, result.image, result.media_type or "image/webp"
+            reply,
+            result.image,
+            result.media_type or "image/webp",
         )
         log = LOGGER.info if delivered else LOGGER.error
         log(
-            "Telegram 任务%s：chat_id=%s message_id=%s job_id=%s",
+            "Telegram 文生图任务%s：chat_id=%s message_id=%s job_id=%s",
             "完成" if delivered else "图片交付失败",
             job.chat_id,
             job.message_id,
             job_id,
         )
+
+    async def _process_image_to_text(self, job: ImageToTextJob) -> None:
+        reply = self.reply_data(job.chat_id, job.message_id, job.message_thread_id)
+        await self._send_progress(reply, "正在反推提示词…", job)
+        try:
+            image = await self.api.download_file(job.file_id)
+        except TelegramError as error:
+            LOGGER.error(
+                "Telegram 图片下载失败：chat_id=%s message_id=%s error=%s",
+                job.chat_id,
+                job.message_id,
+                error,
+            )
+            await self.api.send_message(reply, "图片下载失败，请重试")
+            return
+
+        job_id: str | None = None
+        try:
+            job_id = await self.backend.submit_image_to_text(image, job.media_type)
+            result = await self._poll(
+                job_id,
+                self.backend.image_to_text_result,
+                job,
+                "图生文",
+            )
+        except BackendApiError as error:
+            LOGGER.error(
+                "Telegram 图生文 API 任务失败：chat_id=%s message_id=%s "
+                "job_id=%s error=%s",
+                job.chat_id,
+                job.message_id,
+                job_id,
+                error,
+            )
+            await self.api.send_message(reply, "反推服务暂时异常，请稍后重试")
+            return
+
+        if result.status == "failed":
+            await self.api.send_message(reply, "反推失败，请重试")
+            return
+        if result.status == "missing":
+            await self.api.send_message(reply, "反推任务已丢失，请重试")
+            return
+        if result.text is None:
+            raise RuntimeError("图生文完成结果缺少文本")
+        delivered = True
+        for chunk in split_message(result.text):
+            delivered = await self.api.send_message(reply, chunk) and delivered
+        log = LOGGER.info if delivered else LOGGER.error
+        log(
+            "Telegram 图生文任务%s：chat_id=%s message_id=%s job_id=%s",
+            "完成" if delivered else "文本交付失败",
+            job.chat_id,
+            job.message_id,
+            job_id,
+        )
+
+    async def _poll(
+        self,
+        job_id: str,
+        fetch: Callable[[str], Awaitable[T | None]],
+        job: TextToImageJob | ImageToTextJob,
+        operation: str,
+    ) -> T:
+        while True:
+            await asyncio.sleep(RESULT_POLL_DELAY)
+            try:
+                result = await fetch(job_id)
+            except TransientBackendApiError as error:
+                result = None
+                LOGGER.warning(
+                    "%s API 查询瞬时失败：chat_id=%s message_id=%s job_id=%s error=%s",
+                    operation,
+                    job.chat_id,
+                    job.message_id,
+                    job_id,
+                    error,
+                )
+            if result is not None:
+                return result
+            LOGGER.info(
+                "%s API 尚无结果：chat_id=%s message_id=%s job_id=%s，%.1f 秒后重试",
+                operation,
+                job.chat_id,
+                job.message_id,
+                job_id,
+                RESULT_POLL_DELAY,
+            )
+
+    async def _send_progress(
+        self,
+        reply: dict[str, str],
+        text: str,
+        job: TextToImageJob | ImageToTextJob,
+    ) -> None:
+        if not await self.api.send_message(reply, text):
+            LOGGER.error(
+                "Telegram 状态消息交付失败，继续任务：chat_id=%s message_id=%s",
+                job.chat_id,
+                job.message_id,
+            )
 
     @staticmethod
     def reply_data(
@@ -470,10 +475,10 @@ async def main() -> None:
     api_token = read_required(config / "api_token.txt")
     async with (
         httpx.AsyncClient(
-            base_url=GENERATION_API_URL,
+            base_url=API_URL,
             headers={"Authorization": f"Bearer {api_token}"},
             timeout=httpx.Timeout(JOB_TIMEOUT, connect=5.0),
-        ) as generation_client,
+        ) as backend_client,
         httpx.AsyncClient(
             base_url="https://api.telegram.org",
             timeout=httpx.Timeout(40.0, connect=10.0),
@@ -481,7 +486,7 @@ async def main() -> None:
     ):
         await TelegramBot(
             TelegramApi(telegram_token, telegram_client),
-            GenerationApi(generation_client),
+            BackendApi(backend_client),
         ).run()
 
 

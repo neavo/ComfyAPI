@@ -1,0 +1,59 @@
+{
+  "1": {
+    "inputs": {
+      "image": "20260724_00002_.webp"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "api_input"
+    }
+  },
+  "2": {
+    "inputs": {
+      "model": "Florence-2-base-PromptGen-v2.0",
+      "precision": "bf16",
+      "convert_to_safetensors": false
+    },
+    "class_type": "Florence2ModelLoader",
+    "_meta": {
+      "title": "Florence2ModelLoader"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text_input": "",
+      "task": "prompt_gen_mixed_caption",
+      "fill_mask": false,
+      "keep_model_loaded": false,
+      "max_new_tokens": 768,
+      "num_beams": 3,
+      "do_sample": true,
+      "output_mask_select": "",
+      "seed": 1,
+      "image": [
+        "1",
+        0
+      ],
+      "florence2_model": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "Florence2Run",
+    "_meta": {
+      "title": "Florence2Run"
+    }
+  },
+  "6": {
+    "inputs": {
+      "source": [
+        "3",
+        2
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "api_output"
+    }
+  }
+}

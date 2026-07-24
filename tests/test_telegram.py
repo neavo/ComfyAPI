@@ -1,128 +1,34 @@
 import asyncio
 import contextlib
-import json
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 from app.telegram import (
     JOB_TIMEOUT,
     QUEUE_CAPACITY,
-    GenerationApi,
-    GenerationApiError,
-    GenerationResult,
-    TelegramApi,
+    ImageToTextJob,
     TelegramBot,
-    TelegramError,
-    TelegramJob,
-    TransientGenerationApiError,
+    TextToImageJob,
+    extract_image,
     extract_instruction,
+    split_message,
 )
-
-JOB_ID = "550e8400-e29b-41d4-a716-446655440000"
-
-
-@pytest.mark.anyio
-async def test_generation_api_submits_authenticated_instruction() -> None:
-    captured: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["method"] = request.method
-        captured["path"] = request.url.path
-        captured["authorization"] = request.headers["authorization"]
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(202, json={"id": JOB_ID})
-
-    async with httpx.AsyncClient(
-        base_url="http://127.0.0.1:48188",
-        headers={"Authorization": "Bearer TOKEN"},
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        result = await GenerationApi(client).submit("画一只猫")
-
-    assert result == JOB_ID
-    assert captured == {
-        "method": "POST",
-        "path": "/new",
-        "authorization": "Bearer TOKEN",
-        "body": {"instruction": "画一只猫"},
-    }
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("status", "body", "expected"),
-    [
-        (200, b"WEBP", "completed"),
-        (202, b"", None),
-        (404, b"{}", "missing"),
-        (500, b"{}", "failed"),
-    ],
+from app.telegram_api import (
+    MAX_IMAGE_BYTES,
+    BackendApiError,
+    ImageApiResult,
+    TextApiResult,
+    TransientBackendApiError,
 )
-async def test_generation_api_maps_result_status(
-    status: int,
-    body: bytes,
-    expected: str | None,
-) -> None:
-    def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            status,
-            content=body,
-            headers={"content-type": "image/webp"},
-        )
-
-    async with httpx.AsyncClient(
-        base_url="http://127.0.0.1:48188",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        result = await GenerationApi(client).result(JOB_ID)
-
-    assert (result.status if result else None) == expected
-    if result and result.status == "completed":
-        assert (result.image, result.media_type) == (b"WEBP", "image/webp")
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("failure", ["network", 502])
-async def test_generation_api_marks_query_outage_transient(
-    failure: str | int,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if failure == "network":
-            raise httpx.ConnectError("连接失败", request=request)
-        return httpx.Response(502)
-
-    async with httpx.AsyncClient(
-        base_url="http://127.0.0.1:48188",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        with pytest.raises(TransientGenerationApiError):
-            await GenerationApi(client).result(JOB_ID)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("operation", ["submit", "result"])
-async def test_generation_api_rejects_broken_contract(operation: str) -> None:
-    def handler(_: httpx.Request) -> httpx.Response:
-        return (
-            httpx.Response(202, json={})
-            if operation == "submit"
-            else httpx.Response(418)
-        )
-
-    async with httpx.AsyncClient(
-        base_url="http://127.0.0.1:48188",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        api = GenerationApi(client)
-        with pytest.raises(GenerationApiError):
-            await getattr(api, operation)("画猫" if operation == "submit" else JOB_ID)
 
 
 def update(
     text: object = "@PainterBot 画一只猫",
     *,
+    caption: object | None = None,
+    photo: object | None = None,
+    document: object | None = None,
     update_id: int = 1,
     message_id: int = 7,
     chat_type: str = "supergroup",
@@ -133,17 +39,26 @@ def update(
         "message_id": message_id,
         "from": {"is_bot": is_bot},
         "chat": {"id": -1001, "type": chat_type},
-        "text": text,
     }
+    if text is not None:
+        message["text"] = text
+    if caption is not None:
+        message["caption"] = caption
+    if photo is not None:
+        message["photo"] = photo
+    if document is not None:
+        message["document"] = document
     if thread_id is not None:
         message["message_thread_id"] = thread_id
     return {"update_id": update_id, "message": message}
 
 
-class FakeApi:
+class FakeTelegram:
     def __init__(self) -> None:
         self.messages: list[tuple[dict[str, str], str]] = []
         self.photos: list[tuple[dict[str, str], bytes, str]] = []
+        self.downloads: list[str] = []
+        self.image = b"IMAGE"
         self.message_results: list[bool] = []
 
     async def get_username(self) -> str:
@@ -151,6 +66,10 @@ class FakeApi:
 
     async def get_updates(self, _: int | None) -> list[dict[str, object]]:
         await asyncio.Future()
+
+    async def download_file(self, file_id: str) -> bytes:
+        self.downloads.append(file_id)
+        return self.image
 
     async def send_message(self, reply: dict[str, str], text: str) -> bool:
         self.messages.append((reply, text))
@@ -166,23 +85,44 @@ class FakeApi:
         return True
 
 
-class FakeGeneration:
-    def __init__(self, results: list[object] | None = None) -> None:
+class FakeBackend:
+    def __init__(
+        self,
+        image_results: list[object] | None = None,
+        text_results: list[object] | None = None,
+    ) -> None:
         self.instructions: list[str] = []
-        self.results = iter(
-            results
-            if results is not None
-            else [GenerationResult("completed", b"WEBP", "image/webp")]
+        self.images: list[tuple[bytes, str]] = []
+        self.image_results = iter(
+            image_results
+            if image_results is not None
+            else [ImageApiResult("completed", b"WEBP", "image/webp")]
+        )
+        self.text_results = iter(
+            text_results
+            if text_results is not None
+            else [TextApiResult("completed", "reverse prompt")]
         )
         self.result_calls = 0
 
-    async def submit(self, instruction: str) -> str:
+    async def submit_text_to_image(self, instruction: str) -> str:
         self.instructions.append(instruction)
-        return f"job-{len(self.instructions)}"
+        return f"image-{len(self.instructions)}"
 
-    async def result(self, _: str) -> GenerationResult | None:
+    async def submit_image_to_text(self, image: bytes, media_type: str) -> str:
+        self.images.append((image, media_type))
+        return f"text-{len(self.images)}"
+
+    async def text_to_image_result(self, _: str) -> ImageApiResult | None:
         self.result_calls += 1
-        result = next(self.results)
+        result = next(self.image_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def image_to_text_result(self, _: str) -> TextApiResult | None:
+        self.result_calls += 1
+        result = next(self.text_results)
         if isinstance(result, Exception):
             raise result
         return result
@@ -214,32 +154,53 @@ def test_only_leading_exact_mention_becomes_instruction(
     assert extract_instruction(text, "PainterBot") == expected
 
 
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "candidate",
-    [
-        update("普通聊天"),
-        update(is_bot=True),
-        update(text=None),
-        {"update_id": 1, "edited_message": {}},
-    ],
-)
-async def test_irrelevant_update_has_no_effect(candidate: dict[str, object]) -> None:
-    api = FakeApi()
-    generation = FakeGeneration()
-    bot = TelegramBot(api, generation)
+def test_image_extraction_selects_largest_photo_and_image_documents() -> None:
+    photo = extract_image(
+        {
+            "photo": [
+                {"file_id": "small", "file_size": 100, "width": 100, "height": 100},
+                {"file_id": "large", "file_size": 500, "width": 500, "height": 500},
+            ]
+        }
+    )
+    document = extract_image(
+        {
+            "document": {
+                "file_id": "original",
+                "file_size": 600,
+                "mime_type": "image/png",
+            }
+        }
+    )
 
-    await bot.accept_update(candidate, "PainterBot")
+    assert photo is not None and (photo.file_id, photo.media_type) == (
+        "large",
+        "image/jpeg",
+    )
+    assert document is not None and (document.file_id, document.media_type) == (
+        "original",
+        "image/png",
+    )
+    assert (
+        extract_image({"document": {"file_id": "text", "mime_type": "text/plain"}})
+        is None
+    )
 
-    assert bot.queue.empty()
-    assert (api.messages, api.photos, generation.instructions) == ([], [], [])
+
+def test_long_text_is_split_without_data_loss() -> None:
+    text = ("word " * 2000).strip()
+
+    chunks = split_message(text, 100)
+
+    assert all(0 < len(chunk) <= 100 for chunk in chunks)
+    assert " ".join(chunks) == text
 
 
 @pytest.mark.anyio
 async def test_private_text_generates_and_replies_with_photo() -> None:
-    api = FakeApi()
-    generation = FakeGeneration()
-    bot = TelegramBot(api, generation)
+    telegram = FakeTelegram()
+    backend = FakeBackend()
+    bot = TelegramBot(telegram, backend)
 
     await bot.accept_update(
         update("  画一只猫  ", chat_type="private", thread_id=None),
@@ -247,25 +208,107 @@ async def test_private_text_generates_and_replies_with_photo() -> None:
     )
     await drain_queue(bot)
 
-    assert generation.instructions == ["画一只猫"]
-    assert [text for _, text in api.messages] == ["正在生成…"]
-    assert api.photos == [
-        (
-            {
-                "chat_id": "-1001",
-                "reply_parameters": '{"message_id": 7, "allow_sending_without_reply": true}',
-            },
-            b"WEBP",
-            "image/webp",
-        )
+    assert backend.instructions == ["画一只猫"]
+    assert [text for _, text in telegram.messages] == ["正在生成…"]
+    assert telegram.photos[0][1:] == (b"WEBP", "image/webp")
+
+
+@pytest.mark.anyio
+async def test_private_photo_downloads_and_returns_prompt() -> None:
+    telegram = FakeTelegram()
+    backend = FakeBackend()
+    bot = TelegramBot(telegram, backend)
+
+    await bot.accept_update(
+        update(
+            None,
+            photo=[
+                {"file_id": "small", "file_size": 100},
+                {"file_id": "large", "file_size": 200},
+            ],
+            chat_type="private",
+            thread_id=None,
+        ),
+        "PainterBot",
+    )
+    await drain_queue(bot)
+
+    assert telegram.downloads == ["large"]
+    assert backend.images == [(b"IMAGE", "image/jpeg")]
+    assert [text for _, text in telegram.messages] == [
+        "正在反推提示词…",
+        "reverse prompt",
     ]
 
 
 @pytest.mark.anyio
+async def test_group_image_requires_leading_mention_in_caption() -> None:
+    telegram = FakeTelegram()
+    backend = FakeBackend()
+    bot = TelegramBot(telegram, backend)
+    photo = [{"file_id": "photo", "file_size": 100}]
+
+    await bot.accept_update(
+        update(None, photo=photo, caption="普通图片"),
+        "PainterBot",
+    )
+    await bot.accept_update(
+        update(None, photo=photo, caption="@PainterBot 请反推"),
+        "PainterBot",
+    )
+    await drain_queue(bot)
+
+    assert telegram.downloads == ["photo"]
+    assert backend.images == [(b"IMAGE", "image/jpeg")]
+
+
+@pytest.mark.anyio
+async def test_private_image_document_is_supported() -> None:
+    telegram = FakeTelegram()
+    backend = FakeBackend()
+    bot = TelegramBot(telegram, backend)
+
+    await bot.accept_update(
+        update(
+            None,
+            document={
+                "file_id": "original",
+                "file_size": 100,
+                "mime_type": "image/webp",
+            },
+            chat_type="private",
+        ),
+        "PainterBot",
+    )
+    await drain_queue(bot)
+
+    assert backend.images == [(b"IMAGE", "image/webp")]
+
+
+@pytest.mark.anyio
+async def test_oversized_image_is_rejected_before_queueing() -> None:
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend())
+
+    await bot.accept_update(
+        update(
+            None,
+            photo=[{"file_id": "huge", "file_size": MAX_IMAGE_BYTES + 1}],
+            chat_type="private",
+        ),
+        "PainterBot",
+    )
+
+    assert bot.queue.empty()
+    assert [text for _, text in telegram.messages] == ["图片不能超过 10 MiB"]
+    assert telegram.downloads == []
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("text", ["/start", "/START@painterbot payload"])
-async def test_private_start_explains_usage(text: str) -> None:
-    api = FakeApi()
-    bot = TelegramBot(api, FakeGeneration())
+async def test_private_start_explains_both_features(text: str) -> None:
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend())
 
     await bot.accept_update(
         update(text, chat_type="private", thread_id=None),
@@ -273,58 +316,15 @@ async def test_private_start_explains_usage(text: str) -> None:
     )
 
     assert bot.queue.empty()
-    assert [text for _, text in api.messages] == ["请直接发送生图描述"]
+    assert [text for _, text in telegram.messages] == [
+        "发送文字生成图片；直接发送图片可反推提示词"
+    ]
 
 
 @pytest.mark.anyio
-async def test_private_unknown_command_is_ignored() -> None:
-    api = FakeApi()
-    bot = TelegramBot(api, FakeGeneration())
-
-    await bot.accept_update(
-        update("/help", chat_type="private", thread_id=None),
-        "PainterBot",
-    )
-
-    assert bot.queue.empty()
-    assert api.messages == []
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("text", "chat_type", "reply"),
-    [
-        ("@PainterBot", "supergroup", "请在 @PainterBot 后输入生图描述"),
-        (
-            "@PainterBot " + "猫" * 4097,
-            "supergroup",
-            "生图描述长度必须为 1 至 4096 个字符",
-        ),
-        ("   ", "private", "请输入生图描述"),
-        ("猫" * 4097, "private", "生图描述长度必须为 1 至 4096 个字符"),
-    ],
-)
-async def test_invalid_instruction_replies_without_queueing(
-    text: str,
-    chat_type: str,
-    reply: str,
-) -> None:
-    api = FakeApi()
-    bot = TelegramBot(api, FakeGeneration())
-
-    await bot.accept_update(
-        update(text, chat_type=chat_type, thread_id=None),
-        "PainterBot",
-    )
-
-    assert bot.queue.empty()
-    assert [text for _, text in api.messages] == [reply]
-
-
-@pytest.mark.anyio
-async def test_full_queue_replies_busy() -> None:
-    api = FakeApi()
-    bot = TelegramBot(api, FakeGeneration())
+async def test_shared_queue_rejects_tasks_when_full() -> None:
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend())
 
     for number in range(QUEUE_CAPACITY + 1):
         await bot.accept_update(
@@ -333,206 +333,118 @@ async def test_full_queue_replies_busy() -> None:
         )
 
     assert bot.queue.qsize() == QUEUE_CAPACITY
-    assert [text for _, text in api.messages] == ["当前生成任务较多，请稍后再试"]
-
-
-@pytest.mark.anyio
-async def test_long_poll_retries_transient_failure(monkeypatch) -> None:
-    sleeps: list[float] = []
-
-    async def record_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    class PollApi(FakeApi):
-        def __init__(self) -> None:
-            super().__init__()
-            self.calls = 0
-
-        async def get_updates(self, _: int | None) -> list[dict[str, object]]:
-            self.calls += 1
-            if self.calls == 1:
-                raise TelegramError("瞬时失败", retryable=True)
-            raise TelegramError("永久失败")
-
-    monkeypatch.setattr(asyncio, "sleep", record_sleep)
-
-    with pytest.raises(TelegramError, match="永久失败"):
-        await TelegramBot(PollApi(), FakeGeneration())._receive("PainterBot")
-
-    assert sleeps == [3.0]
-
-
-@pytest.mark.anyio
-async def test_telegram_429_uses_retry_after(monkeypatch) -> None:
-    attempts = 0
-    sleeps: list[float] = []
-
-    async def record_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    def handler(_: httpx.Request) -> httpx.Response:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            return httpx.Response(
-                429,
-                json={
-                    "ok": False,
-                    "description": "Too Many Requests",
-                    "parameters": {"retry_after": 7},
-                },
-            )
-        return httpx.Response(200, json={"ok": True, "result": {}})
-
-    monkeypatch.setattr(asyncio, "sleep", record_sleep)
-    async with httpx.AsyncClient(
-        base_url="https://api.telegram.org",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        delivered = await TelegramApi("TOKEN", client).send_message({}, "状态")
-
-    assert delivered is True
-    assert attempts == 2
-    assert sleeps == [7]
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("failure", "expected_attempts"),
-    [("network", 3), (400, 1)],
-)
-async def test_outbound_retries_only_transient_failure(
-    failure: str | int,
-    expected_attempts: int,
-    monkeypatch,
-) -> None:
-    attempts = 0
-
-    async def no_wait(_: float) -> None:
-        return None
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal attempts
-        attempts += 1
-        if failure == "network":
-            raise httpx.ConnectError("连接失败", request=request)
-        return httpx.Response(failure, json={"ok": False, "description": "失败"})
-
-    monkeypatch.setattr(asyncio, "sleep", no_wait)
-    async with httpx.AsyncClient(
-        base_url="https://api.telegram.org",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        delivered = await TelegramApi("TOKEN", client).send_message({}, "状态")
-
-    assert delivered is False
-    assert attempts == expected_attempts
-
-
-@pytest.mark.anyio
-async def test_failed_processing_notice_does_not_stop_generation() -> None:
-    api = FakeApi()
-    api.message_results = [False]
-    generation = FakeGeneration()
-    bot = TelegramBot(api, generation)
-
-    await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
-    await drain_queue(bot)
-
-    assert generation.instructions == ["画猫"]
-    assert len(api.photos) == 1
+    assert [text for _, text in telegram.messages] == ["当前任务较多，请稍后再试"]
 
 
 @pytest.mark.anyio
 async def test_polling_survives_pending_and_transient_results() -> None:
-    api = FakeApi()
-    generation = FakeGeneration(
-        [
+    telegram = FakeTelegram()
+    backend = FakeBackend(
+        image_results=[
             None,
-            TransientGenerationApiError("短暂失败"),
-            GenerationResult("completed", b"WEBP", "image/webp"),
+            TransientBackendApiError("短暂失败"),
+            ImageApiResult("completed", b"WEBP", "image/webp"),
         ]
     )
-    bot = TelegramBot(api, generation)
+    bot = TelegramBot(telegram, backend)
 
     await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
     await drain_queue(bot)
 
-    assert generation.result_calls == 3
-    assert len(api.photos) == 1
+    assert backend.result_calls == 3
+    assert len(telegram.photos) == 1
+
+
+@pytest.mark.anyio
+async def test_long_reverse_prompt_is_delivered_in_multiple_messages() -> None:
+    telegram = FakeTelegram()
+    prompt = ("word " * 2000).strip()
+    bot = TelegramBot(
+        telegram,
+        FakeBackend(text_results=[TextApiResult("completed", prompt)]),
+    )
+
+    await bot.accept_update(
+        update(None, photo=[{"file_id": "photo"}], chat_type="private"),
+        "PainterBot",
+    )
+    await drain_queue(bot)
+
+    delivered = [text for _, text in telegram.messages][1:]
+    assert len(delivered) > 1
+    assert " ".join(delivered) == prompt
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("result", "expected"),
+    ("job", "results", "expected"),
     [
-        (GenerationResult("failed"), "生成失败，请重试"),
-        (GenerationResult("missing"), "生成任务已丢失，请重试"),
-        (GenerationApiError("协议异常"), "生图服务暂时异常，请稍后重试"),
+        (
+            TextToImageJob(-1001, 7, None, "画猫", float("inf")),
+            {"image_results": [ImageApiResult("failed")]},
+            "生成失败，请重试",
+        ),
+        (
+            ImageToTextJob(-1001, 7, None, "photo", "image/jpeg", float("inf")),
+            {"text_results": [TextApiResult("missing")]},
+            "反推任务已丢失，请重试",
+        ),
+        (
+            TextToImageJob(-1001, 7, None, "画猫", float("inf")),
+            {"image_results": [BackendApiError("协议异常")]},
+            "生图服务暂时异常，请稍后重试",
+        ),
     ],
 )
-async def test_generation_failure_returns_stable_message(
-    result: GenerationResult | Exception,
+async def test_task_failures_return_stable_messages(
+    job: TextToImageJob | ImageToTextJob,
+    results: dict[str, list[object]],
     expected: str,
 ) -> None:
-    api = FakeApi()
-    bot = TelegramBot(api, FakeGeneration([result]))
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend(**results))
+    bot.queue.put_nowait(job)
 
-    await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
     await drain_queue(bot)
 
-    assert [text for _, text in api.messages] == ["正在生成…", expected]
-    assert api.photos == []
+    assert [text for _, text in telegram.messages][-1] == expected
+    assert telegram.photos == []
 
 
 @pytest.mark.anyio
 async def test_expired_job_does_not_block_next_job() -> None:
-    class TimeoutGeneration(FakeGeneration):
-        async def submit(self, instruction: str) -> str:
+    class TimeoutBackend(FakeBackend):
+        async def submit_text_to_image(self, instruction: str) -> str:
             self.instructions.append(instruction)
             if instruction == "超时任务":
                 await asyncio.Future()
             return "job-ok"
 
-    api = FakeApi()
-    generation = TimeoutGeneration()
-    bot = TelegramBot(api, generation)
+    telegram = FakeTelegram()
+    backend = TimeoutBackend()
+    bot = TelegramBot(telegram, backend)
     loop = asyncio.get_running_loop()
-    bot.queue.put_nowait(TelegramJob(-1001, 1, None, "超时任务", loop.time()))
+    bot.queue.put_nowait(TextToImageJob(-1001, 1, None, "超时任务", loop.time()))
     bot.queue.put_nowait(
-        TelegramJob(-1001, 2, None, "后续任务", loop.time() + JOB_TIMEOUT)
+        TextToImageJob(-1001, 2, None, "后续任务", loop.time() + JOB_TIMEOUT)
     )
 
     await drain_queue(bot)
 
-    assert "生成超时，请稍后重试" in [text for _, text in api.messages]
-    assert generation.instructions == ["超时任务", "后续任务"]
-    assert len(api.photos) == 1
+    assert "任务超时，请稍后重试" in [text for _, text in telegram.messages]
+    assert backend.instructions == ["超时任务", "后续任务"]
+    assert len(telegram.photos) == 1
 
 
 @pytest.mark.anyio
-async def test_completed_result_replies_in_topic_with_webp() -> None:
-    requests: list[httpx.Request] = []
+async def test_completed_image_replies_in_original_topic() -> None:
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend())
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json={"ok": True, "result": {}})
+    await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
+    await drain_queue(bot)
 
-    async with httpx.AsyncClient(
-        base_url="https://api.telegram.org",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        bot = TelegramBot(TelegramApi("TOKEN", client), FakeGeneration())
-        await bot.accept_update(update("@PainterBot 画猫"), "PainterBot")
-        await drain_queue(bot)
-
-    assert [request.url.path.rsplit("/", 1)[-1] for request in requests] == [
-        "sendMessage",
-        "sendPhoto",
-    ]
-    photo = requests[1].content
-    assert b"WEBP" in photo
-    assert b'filename="result.webp"' in photo
-    assert b"image/webp" in photo
-    assert b'"message_id": 7' in photo
-    assert b"11" in photo
+    reply = telegram.photos[0][0]
+    assert reply["chat_id"] == "-1001"
+    assert '"message_id": 7' in reply["reply_parameters"]
+    assert reply["message_thread_id"] == "11"

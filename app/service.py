@@ -10,14 +10,17 @@ from uuid import uuid4
 
 import httpx
 
-from .comfy import ComfyClient, GenerationResult
+from .comfy import ComfyClient, ComfyError, JobStatus
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "generation.json"
+TEXT_TO_IMAGE_WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "generation.json"
+IMAGE_TO_TEXT_WORKFLOW_PATH = PROJECT_ROOT / "workflows" / "image_to_text.json"
+INPUT_MARKER = "api_input"
+OUTPUT_MARKER = "api_output"
 PASSTHROUGH_MARKER = "启用透传模式"
 PROMPT_SUFFIX = """
 safe
-(mature:-1), (aged down:1)
+(mature:-1), aged down
 (simple background:-1.25)
 (shiny skin:-1), flat color, anime coloring
 masterpiece, best quality, score_7
@@ -27,6 +30,13 @@ LOGGER = logging.getLogger(__name__)
 LLM_ATTEMPTS = 2
 RETRY_DELAY = 3.0
 TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+IMAGE_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+IMAGE_MEDIA_TYPES = frozenset(IMAGE_EXTENSIONS)
 
 
 class LlmUpstreamError(RuntimeError):
@@ -49,11 +59,25 @@ class Settings:
 @dataclass(frozen=True, slots=True)
 class WorkflowTemplate:
     data: dict[str, Any]
-    instruction_node_id: str
+    input_node_id: str
     output_node_id: str
+    input_name: str
 
 
-class GenerationService:
+@dataclass(frozen=True, slots=True)
+class ImageResult:
+    status: JobStatus
+    image: bytes | None = None
+    media_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TextResult:
+    status: JobStatus
+    text: str | None = None
+
+
+class TextToImageService:
     def __init__(
         self,
         comfy: ComfyClient,
@@ -82,11 +106,63 @@ class GenerationService:
                 self.system_prompt,
                 instruction,
             )
-        await self.comfy.submit(job_id, build_prompt(self.workflow, prompt))
+        await self.comfy.submit(
+            job_id,
+            build_workflow(self.workflow, prompt, randomize_seeds=True),
+        )
         return job_id
 
-    async def result(self, job_id: str) -> GenerationResult:
-        return await self.comfy.result(job_id)
+    async def result(self, job_id: str) -> ImageResult:
+        job = await self.comfy.job(job_id)
+        if job.status != "completed":
+            return ImageResult(job.status)
+        output = job.outputs.get(self.workflow.output_node_id) if job.outputs else None
+        images = output.get("images") if isinstance(output, dict) else None
+        if not isinstance(images, list):
+            raise ComfyError("成功任务缺少 api_output images")
+        image = next(
+            (
+                item
+                for item in images
+                if isinstance(item, dict) and item.get("type") == "output"
+            ),
+            None,
+        )
+        if image is None:
+            raise ComfyError("成功任务没有 output 图片")
+        downloaded = await self.comfy.download_image(image)
+        return ImageResult("completed", downloaded.content, downloaded.media_type)
+
+
+class ImageToTextService:
+    def __init__(self, comfy: ComfyClient, workflow: WorkflowTemplate) -> None:
+        self.comfy = comfy
+        self.workflow = workflow
+
+    async def submit(self, image: bytes, media_type: str) -> str:
+        job_id = str(uuid4())
+        filename = f"{job_id}.{IMAGE_EXTENSIONS[media_type]}"
+        uploaded = await self.comfy.upload_image(filename, image, media_type)
+        await self.comfy.submit(
+            job_id,
+            build_workflow(self.workflow, uploaded),
+        )
+        return job_id
+
+    async def result(self, job_id: str) -> TextResult:
+        job = await self.comfy.job(job_id)
+        if job.status != "completed":
+            return TextResult(job.status)
+        output = job.outputs.get(self.workflow.output_node_id) if job.outputs else None
+        texts = output.get("text") if isinstance(output, dict) else None
+        text = (
+            texts[0].strip()
+            if isinstance(texts, list) and texts and isinstance(texts[0], str)
+            else None
+        )
+        if not text:
+            raise ComfyError("成功任务缺少 api_output text")
+        return TextResult("completed", text)
 
 
 def normalize_instruction(value: str) -> str:
@@ -150,15 +226,15 @@ def load_system_prompt(path: Path | None = None) -> str:
     return prompt
 
 
-def load_workflow(path: Path = WORKFLOW_PATH) -> WorkflowTemplate:
+def load_workflow(path: Path, input_name: str) -> WorkflowTemplate:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"无法加载工作流 {path}: {error}") from error
-    return resolve_workflow(data)
+    return resolve_workflow(data, input_name)
 
 
-def resolve_workflow(data: object) -> WorkflowTemplate:
+def resolve_workflow(data: object, input_name: str) -> WorkflowTemplate:
     if not isinstance(data, dict):
         raise RuntimeError("工作流必须是节点对象")
 
@@ -175,21 +251,27 @@ def resolve_workflow(data: object) -> WorkflowTemplate:
             raise RuntimeError(f"工作流必须恰好包含一个 {title} 节点")
         return matches[0]
 
-    instruction_id, instruction = unique_node("API Instruction")
+    input_id, input_node = unique_node(INPUT_MARKER)
     if (
-        not isinstance(instruction.get("inputs"), dict)
-        or "text" not in instruction["inputs"]
+        not isinstance(input_node.get("inputs"), dict)
+        or input_name not in input_node["inputs"]
     ):
-        raise RuntimeError("API Instruction 节点必须包含 inputs.text")
+        raise RuntimeError(f"{INPUT_MARKER} 节点必须包含 inputs.{input_name}")
 
-    output_id, _ = unique_node("API Output")
-    return WorkflowTemplate(data, instruction_id, output_id)
+    output_id, _ = unique_node(OUTPUT_MARKER)
+    return WorkflowTemplate(data, input_id, output_id, input_name)
 
 
-def build_prompt(template: WorkflowTemplate, instruction: str) -> dict[str, Any]:
+def build_workflow(
+    template: WorkflowTemplate,
+    value: str,
+    *,
+    randomize_seeds: bool = False,
+) -> dict[str, Any]:
     prompt = copy.deepcopy(template.data)
-    prompt[template.instruction_node_id]["inputs"]["text"] = instruction
-    _randomize_seeds(prompt)
+    prompt[template.input_node_id]["inputs"][template.input_name] = value
+    if randomize_seeds:
+        _randomize_seeds(prompt)
     return prompt
 
 
@@ -216,7 +298,6 @@ async def preprocess_instruction(
                 headers={"Authorization": f"Bearer {settings.llm_api_key}"},
                 json={
                     "model": settings.llm_model,
-                    # "thinking": {"type": "disabled"},
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": instruction},

@@ -5,20 +5,21 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.comfy import GenerationResult
 from app import service
+from app.comfy import ComfyError, ComfyJob, DownloadedImage
 
 
-def workflow_data() -> dict[str, object]:
+def workflow_data(input_name: str = "text") -> dict[str, object]:
     return {
         "10": {
-            "inputs": {"text": "原始指令", "seed": 1},
-            "class_type": "CLIPTextEncode",
-            "_meta": {"title": "API Instruction"},
+            "inputs": {input_name: "原始输入", "seed": 1},
+            "class_type": "Input",
+            "_meta": {"title": "api_input"},
         },
         "20": {
-            "inputs": {"images": ["2", 0], "noise_seed": 2},
-            "_meta": {"title": "API Output"},
+            "inputs": {"source": ["10", 0], "noise_seed": 2},
+            "class_type": "Output",
+            "_meta": {"title": "api_output"},
         },
     }
 
@@ -34,30 +35,40 @@ def settings() -> service.Settings:
 
 
 class FakeComfy:
-    def __init__(
-        self,
-        result: GenerationResult = GenerationResult("missing"),
-    ) -> None:
-        self.result_value = result
+    def __init__(self, job: ComfyJob = ComfyJob("missing")) -> None:
+        self.job_value = job
         self.submissions: list[tuple[str, dict[str, object]]] = []
+        self.uploads: list[tuple[str, bytes, str]] = []
+
+    async def upload_image(
+        self,
+        filename: str,
+        image: bytes,
+        media_type: str,
+    ) -> str:
+        self.uploads.append((filename, image, media_type))
+        return f"api/image_to_text/{filename}"
 
     async def submit(self, job_id: str, prompt: dict[str, object]) -> None:
         self.submissions.append((job_id, prompt))
 
-    async def result(self, _: str) -> GenerationResult:
-        return self.result_value
+    async def job(self, _: str) -> ComfyJob:
+        return self.job_value
+
+    async def download_image(self, _: object) -> DownloadedImage:
+        return DownloadedImage(b"WEBP", "image/webp")
 
 
-def generation(
+def text_to_image(
     client: httpx.AsyncClient,
     comfy: FakeComfy | None = None,
-) -> service.GenerationService:
-    return service.GenerationService(
+) -> service.TextToImageService:
+    return service.TextToImageService(
         comfy or FakeComfy(),
         client,
         settings(),
         "系统指令",
-        service.resolve_workflow(workflow_data()),
+        service.resolve_workflow(workflow_data(), "text"),
     )
 
 
@@ -213,28 +224,41 @@ async def test_llm_permanent_failure_is_not_retried() -> None:
     assert attempts == 1
 
 
-def test_workflow_markers_are_resolved() -> None:
-    template = service.resolve_workflow(workflow_data())
+@pytest.mark.parametrize("input_name", ["text", "image"])
+def test_workflow_markers_resolve_for_both_input_types(input_name: str) -> None:
+    template = service.resolve_workflow(workflow_data(input_name), input_name)
 
-    assert (template.instruction_node_id, template.output_node_id) == ("10", "20")
-
-
-def test_committed_workflow_builds_prompt() -> None:
-    template = service.load_workflow()
-
-    prompt = service.build_prompt(template, "生成雨夜街道")
-
-    assert prompt[template.instruction_node_id]["inputs"]["text"] == "生成雨夜街道"
+    assert (
+        template.input_node_id,
+        template.output_node_id,
+        template.input_name,
+    ) == ("10", "20", input_name)
 
 
-@pytest.mark.parametrize("title", ["API Instruction", "API Output"])
+def test_committed_workflows_build_prompts() -> None:
+    text = service.load_workflow(service.TEXT_TO_IMAGE_WORKFLOW_PATH, "text")
+    image = service.load_workflow(service.IMAGE_TO_TEXT_WORKFLOW_PATH, "image")
+
+    assert (
+        service.build_workflow(text, "生成雨夜")[text.input_node_id]["inputs"]["text"]
+        == "生成雨夜"
+    )
+    assert (
+        service.build_workflow(image, "api/input.webp")[image.input_node_id]["inputs"][
+            "image"
+        ]
+        == "api/input.webp"
+    )
+
+
+@pytest.mark.parametrize("title", ["api_input", "api_output"])
 def test_missing_or_duplicate_workflow_marker_stops_startup(title: str) -> None:
     missing = workflow_data()
     source = next(node for node in missing.values() if node["_meta"]["title"] == title)
     source["_meta"]["title"] = "缺失标记"
 
     with pytest.raises(RuntimeError, match=title):
-        service.resolve_workflow(missing)
+        service.resolve_workflow(missing, "text")
 
     duplicate = workflow_data()
     source = next(
@@ -243,32 +267,38 @@ def test_missing_or_duplicate_workflow_marker_stops_startup(title: str) -> None:
     duplicate["30"] = copy.deepcopy(source)
 
     with pytest.raises(RuntimeError, match=title):
-        service.resolve_workflow(duplicate)
+        service.resolve_workflow(duplicate, "text")
 
 
-def test_instruction_marker_requires_text_input() -> None:
+def test_input_marker_requires_configured_field() -> None:
     data = workflow_data()
     del data["10"]["inputs"]["text"]
 
     with pytest.raises(RuntimeError, match="inputs.text"):
-        service.resolve_workflow(data)
+        service.resolve_workflow(data, "text")
 
 
-def test_build_prompt_copies_template_and_randomizes_seeds(monkeypatch) -> None:
-    template = service.resolve_workflow(workflow_data())
+def test_build_workflow_only_randomizes_seeds_when_requested(monkeypatch) -> None:
+    template = service.resolve_workflow(workflow_data(), "text")
     original = copy.deepcopy(template.data)
     seeds = iter([101, 202])
     monkeypatch.setattr(service.random, "randint", lambda *_: next(seeds))
 
-    prompt = service.build_prompt(template, "生成雨夜街道")
+    stable = service.build_workflow(template, "稳定")
+    randomized = service.build_workflow(
+        template,
+        "随机",
+        randomize_seeds=True,
+    )
 
-    assert prompt["10"]["inputs"] == {"text": "生成雨夜街道", "seed": 101}
-    assert prompt["20"]["inputs"]["noise_seed"] == 202
+    assert stable["10"]["inputs"] == {"text": "稳定", "seed": 1}
+    assert randomized["10"]["inputs"] == {"text": "随机", "seed": 101}
+    assert randomized["20"]["inputs"]["noise_seed"] == 202
     assert template.data == original
 
 
 @pytest.mark.anyio
-async def test_passthrough_submission_skips_llm_and_removes_markers() -> None:
+async def test_text_to_image_passthrough_skips_llm() -> None:
     comfy = FakeComfy()
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -277,7 +307,7 @@ async def test_passthrough_submission_skips_llm_and_removes_markers() -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
     ) as client:
-        job_id = await generation(client, comfy).submit(
+        job_id = await text_to_image(client, comfy).submit(
             "保留 启用透传模式中间启用透传模式 空格"
         )
 
@@ -288,29 +318,60 @@ async def test_passthrough_submission_skips_llm_and_removes_markers() -> None:
 
 
 @pytest.mark.anyio
-async def test_passthrough_without_instruction_is_rejected_before_submission() -> None:
-    def handler(_: httpx.Request) -> httpx.Response:
-        raise AssertionError("不应访问上游")
+async def test_text_to_image_returns_downloaded_output() -> None:
+    comfy = FakeComfy(
+        ComfyJob(
+            "completed",
+            {
+                "20": {
+                    "images": [
+                        {"filename": "preview.png", "type": "temp"},
+                        {
+                            "filename": "final.webp",
+                            "subfolder": "api",
+                            "type": "output",
+                        },
+                    ]
+                }
+            },
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        result = await text_to_image(client, comfy).result("job")
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        with pytest.raises(service.InstructionError):
-            await generation(client).submit("启用透传模式启用透传模式")
+    assert result == service.ImageResult("completed", b"WEBP", "image/webp")
 
 
 @pytest.mark.anyio
-async def test_llm_failure_is_distinguished_from_comfy_failure() -> None:
-    paths: list[str] = []
+async def test_image_to_text_uploads_and_returns_raw_text() -> None:
+    comfy = FakeComfy(
+        ComfyJob("completed", {"20": {"text": ["  description\n\ntags  "]}})
+    )
+    image_to_text = service.ImageToTextService(
+        comfy,
+        service.resolve_workflow(workflow_data("image"), "image"),
+    )
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
-        return httpx.Response(200, json={"choices": []})
+    job_id = await image_to_text.submit(b"PNG", "image/png")
+    result = await image_to_text.result(job_id)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        with pytest.raises(service.LlmUpstreamError):
-            await generation(client).submit("生成雨夜")
+    assert comfy.uploads == [(f"{job_id}.png", b"PNG", "image/png")]
+    assert comfy.submissions[0][1]["10"]["inputs"]["image"] == (
+        f"api/image_to_text/{job_id}.png"
+    )
+    assert result == service.TextResult("completed", "description\n\ntags")
 
-    assert paths == ["/v1/chat/completions"]
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("output", [{}, {"text": [123]}])
+async def test_completed_job_without_expected_output_is_upstream_error(
+    output: dict[str, object],
+) -> None:
+    comfy = FakeComfy(ComfyJob("completed", {"20": output}))
+    image_to_text = service.ImageToTextService(
+        comfy,
+        service.resolve_workflow(workflow_data("image"), "image"),
+    )
+
+    with pytest.raises(ComfyError):
+        await image_to_text.result("job")

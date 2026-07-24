@@ -6,6 +6,7 @@ import httpx
 
 
 LOGGER = logging.getLogger(__name__)
+JobStatus = Literal["processing", "completed", "failed", "missing"]
 
 
 class ComfyError(RuntimeError):
@@ -13,16 +14,58 @@ class ComfyError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class GenerationResult:
-    status: Literal["processing", "completed", "failed", "missing"]
-    image: bytes | None = None
-    media_type: str | None = None
+class ComfyJob:
+    status: JobStatus
+    outputs: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadedImage:
+    content: bytes
+    media_type: str
 
 
 class ComfyClient:
-    def __init__(self, client: httpx.AsyncClient, output_node_id: str) -> None:
+    def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
-        self.output_node_id = output_node_id
+
+    async def upload_image(
+        self,
+        filename: str,
+        image: bytes,
+        media_type: str,
+    ) -> str:
+        try:
+            response = await self.client.post(
+                "/upload/image",
+                data={
+                    "type": "input",
+                    "subfolder": "api/image_to_text",
+                    "overwrite": "false",
+                },
+                files={"image": (filename, image, media_type)},
+                timeout=30.0,
+            )
+        except httpx.RequestError as error:
+            raise ComfyError(
+                f"POST /upload/image 请求失败: {type(error).__name__}"
+            ) from error
+        payload = self._json(response, "POST /upload/image")
+        if response.is_error:
+            raise ComfyError(f"POST /upload/image 返回 HTTP {response.status_code}")
+        if not isinstance(payload, dict):
+            raise ComfyError("POST /upload/image 响应不是对象")
+        name = payload.get("name")
+        subfolder = payload.get("subfolder")
+        image_type = payload.get("type")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(subfolder, str)
+            or image_type != "input"
+        ):
+            raise ComfyError("POST /upload/image 响应字段损坏")
+        return "/".join(part for part in (subfolder.replace("\\", "/"), name) if part)
 
     async def submit(self, job_id: str, prompt: dict[str, Any]) -> None:
         try:
@@ -49,24 +92,37 @@ class ComfyClient:
         if not isinstance(payload, dict) or payload.get("prompt_id") != job_id:
             raise ComfyError("POST /prompt 返回的 prompt_id 不匹配")
 
-    async def result(self, job_id: str) -> GenerationResult:
-        history = await self._history(job_id)
-        if history is None:
-            if await self._queued(job_id):
-                return GenerationResult("processing")
-            history = await self._history(job_id)
-            if history is None:
-                return GenerationResult("missing")
-        if history == "failed":
-            return GenerationResult("failed")
-        response = await self._get("/view", params=history)
-        return GenerationResult(
-            "completed",
+    async def job(self, job_id: str) -> ComfyJob:
+        job = await self._history(job_id)
+        if job is not None:
+            return job
+        if await self._queued(job_id):
+            return ComfyJob("processing")
+        return await self._history(job_id) or ComfyJob("missing")
+
+    async def download_image(self, image: object) -> DownloadedImage:
+        if not isinstance(image, dict):
+            raise ComfyError("图片元数据结构损坏")
+        if image.get("type") != "output":
+            raise ComfyError("图片不是 output 文件")
+        if not all(
+            isinstance(image.get(field), str) for field in ("filename", "subfolder")
+        ):
+            raise ComfyError("图片元数据字段损坏")
+        response = await self._get(
+            "/view",
+            params={
+                "filename": image["filename"],
+                "subfolder": image["subfolder"].replace("\\", "/"),
+                "type": "output",
+            },
+        )
+        return DownloadedImage(
             response.content,
             response.headers.get("content-type", "image/webp"),
         )
 
-    async def _history(self, job_id: str) -> dict[str, str] | Literal["failed"] | None:
+    async def _history(self, job_id: str) -> ComfyJob | None:
         response = await self._get(f"/history/{job_id}")
         history = self._json(response, "GET /history")
         if not isinstance(history, dict):
@@ -78,30 +134,13 @@ class ComfyClient:
             raise ComfyError("history 任务结构损坏")
         status = record["status"].get("status_str")
         if status == "error":
-            return "failed"
+            return ComfyJob("failed")
         if status != "success":
             raise ComfyError("history 任务状态未知")
-
         outputs = record.get("outputs")
-        output = outputs.get(self.output_node_id) if isinstance(outputs, dict) else None
-        images = output.get("images") if isinstance(output, dict) else None
-        if not isinstance(images, list):
-            raise ComfyError("成功任务缺少 API Output images")
-        for image in images:
-            if not isinstance(image, dict):
-                raise ComfyError("图片元数据结构损坏")
-            if image.get("type") != "output":
-                continue
-            if not all(
-                isinstance(image.get(field), str) for field in ("filename", "subfolder")
-            ):
-                raise ComfyError("图片元数据字段损坏")
-            return {
-                "filename": image["filename"],
-                "subfolder": image["subfolder"].replace("\\", "/"),
-                "type": "output",
-            }
-        raise ComfyError("成功任务没有 output 文件")
+        if not isinstance(outputs, dict):
+            raise ComfyError("成功任务缺少 outputs")
+        return ComfyJob("completed", outputs)
 
     async def _queued(self, job_id: str) -> bool:
         response = await self._get("/queue")
