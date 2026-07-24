@@ -28,6 +28,17 @@ JOB_TIMEOUT = 180.0
 RESULT_POLL_DELAY = 3.0
 TELEGRAM_MESSAGE_LIMIT = 4096
 API_URL = "http://127.0.0.1:48188"
+HELP_TEXT = """🤖 使用帮助
+
+🎨 生图
+发送文字描述；群聊格式：@机器人 生图描述
+
+🔍 反推提示词
+发送照片或 JPEG、PNG、WebP 图片文件；群聊请在图片说明中 @机器人
+
+⚡ 透传提示词
+格式：启用透传模式 <提示词>
+作用：跳过自动扩写"""
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 
@@ -246,11 +257,8 @@ class TelegramBot:
             instruction = text.strip()
             if instruction:
                 command = instruction.split(maxsplit=1)[0].casefold()
-                if command in {"/start", f"/start@{username}".casefold()}:
-                    await self.api.send_message(
-                        reply,
-                        "发送文字生成图片；直接发送图片可反推提示词",
-                    )
+                if command in {"/help", f"/help@{username}".casefold()}:
+                    await self.api.send_message(reply, HELP_TEXT)
                     return
                 if instruction.startswith("/"):
                     return
@@ -260,11 +268,7 @@ class TelegramBot:
                 return
 
         if not instruction:
-            prompt = (
-                "请输入生图描述"
-                if chat_type == "private"
-                else f"请在 @{username} 后输入生图描述"
-            )
+            prompt = "请输入生图描述" if chat_type == "private" else HELP_TEXT
             await self.api.send_message(reply, prompt)
             return
         if len(instruction) > 4096:

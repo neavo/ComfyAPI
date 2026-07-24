@@ -133,7 +133,7 @@ $caption = Invoke-RestMethod -Method Post `
 - 私聊直接发送照片或 JPEG、PNG、WebP 图片文件：反推提示词。
 - 群聊中，文字或图片说明必须以 `@机器人用户名` 开头。
 - `tg_safe_mode_exempt_chat_ids` 中的群聊文生图请求使用 `safe_mode=false`。
-- `/start` 显示使用提示。
+- 私聊发送 `/help`，或在群聊中单独 `@机器人用户名`：显示使用帮助。
 
 在 BotFather 中关闭 **Group Privacy Mode** 后再将机器人加入群组。机器人使用
 同一个有界队列处理两类任务；重启后不会恢复未完成任务。

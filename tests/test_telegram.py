@@ -22,6 +22,18 @@ from app.telegram_api import (
     TransientBackendApiError,
 )
 
+EXPECTED_HELP = """🤖 使用帮助
+
+🎨 生图
+发送文字描述；群聊格式：@机器人 生图描述
+
+🔍 反推提示词
+发送照片或 JPEG、PNG、WebP 图片文件；群聊请在图片说明中 @机器人
+
+⚡ 透传提示词
+格式：启用透传模式 <提示词>
+作用：跳过自动扩写"""
+
 
 def update(
     text: object = "@PainterBot 画一只猫",
@@ -289,7 +301,7 @@ async def test_group_image_requires_leading_mention_in_caption() -> None:
         "PainterBot",
     )
     await bot.accept_update(
-        update(None, photo=photo, caption="@PainterBot 请反推"),
+        update(None, photo=photo, caption="@PainterBot"),
         "PainterBot",
     )
     await drain_queue(bot)
@@ -341,8 +353,8 @@ async def test_oversized_image_is_rejected_before_queueing() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("text", ["/start", "/START@painterbot payload"])
-async def test_private_start_explains_both_features(text: str) -> None:
+@pytest.mark.parametrize("text", ["/help", "/HELP@painterbot payload"])
+async def test_private_help_explains_all_features(text: str) -> None:
     telegram = FakeTelegram()
     bot = TelegramBot(telegram, FakeBackend())
 
@@ -352,9 +364,32 @@ async def test_private_start_explains_both_features(text: str) -> None:
     )
 
     assert bot.queue.empty()
-    assert [text for _, text in telegram.messages] == [
-        "发送文字生成图片；直接发送图片可反推提示词"
-    ]
+    assert [text for _, text in telegram.messages] == [EXPECTED_HELP]
+
+
+@pytest.mark.anyio
+async def test_private_start_is_ignored() -> None:
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend())
+
+    await bot.accept_update(
+        update("/start", chat_type="private", thread_id=None),
+        "PainterBot",
+    )
+
+    assert bot.queue.empty()
+    assert telegram.messages == []
+
+
+@pytest.mark.anyio
+async def test_group_bare_mention_shows_help() -> None:
+    telegram = FakeTelegram()
+    bot = TelegramBot(telegram, FakeBackend())
+
+    await bot.accept_update(update("@PainterBot"), "PainterBot")
+
+    assert bot.queue.empty()
+    assert [text for _, text in telegram.messages] == [EXPECTED_HELP]
 
 
 @pytest.mark.anyio
